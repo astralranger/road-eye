@@ -22,26 +22,7 @@
 
 ## 🏗️ System Architecture
 
-```mermaid
-graph TD
-    Phone[Mobile App (Flutter)] -->|1. Post Image + GPS + IMU| CF[Cloudflare Tunnel]
-    CF -->|2. Forward Request| PC[Local PC (Python FastAPI)]
-    
-    subgraph "Edge Node (Your PC)"
-        PC -->|3. Run YOLO Inference| AI{Pothole?}
-        AI -->|No| Log[Log Roughness Only]
-        AI -->|Yes| Process[Draw Boxes & Compress]
-    end
-    
-    subgraph "Cloud (Supabase)"
-        Log -->|4. Insert Metadata| DB[(PostgreSQL DB)]
-        Process -->|5. Upload Image| Bucket[Storage Bucket]
-        Process -->|6. Insert Detection Record| DB
-    end
-    
-    Phone -->|7. View Map| DB
-```
-
+(yoloflow-architecture.png)
 ---
 
 ## 🛠️ Prerequisites
