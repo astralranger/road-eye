@@ -22,7 +22,7 @@
 
 ## 🏗️ System Architecture
 
-(yoloflow-architecture.png)
+![alt text](yoloflow-architecture.png)
 ---
 
 ## 🛠️ Prerequisites
