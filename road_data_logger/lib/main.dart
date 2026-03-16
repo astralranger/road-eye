@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:ui'; // For image filter (blur)
+import 'dart:ui';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -40,53 +40,131 @@ class MyApp extends StatelessWidget {
       title: 'Road Sense Pro',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
-        scaffoldBackgroundColor: const Color(0xFF0F172A), // Slate 900
+        scaffoldBackgroundColor: const Color(0xFF0F172A),
         colorScheme: const ColorScheme.dark(
-          primary: Color(0xFF38BDF8), // Sky Blue
-          secondary: Color(0xFFF472B6), // Pink
+          primary: Color(0xFF38BDF8),
+          secondary: Color(0xFFF472B6),
           surface: Color(0xFF1E293B),
         ),
       ),
-      home: DataCollectorView(camera: camera),
+      home: StreamBuilder<AuthState>(
+        stream: Supabase.instance.client.auth.onAuthStateChange,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const Scaffold(body: Center(child: CircularProgressIndicator()));
+          }
+          final session = snapshot.data?.session;
+          if (session != null) {
+            return DataCollectorView(camera: camera);
+          } else {
+            return const AuthScreen();
+          }
+        },
+      ),
     );
   }
 }
 
+// --- AUTH LOGIN SCREEN ---
+class AuthScreen extends StatefulWidget {
+  const AuthScreen({super.key});
+  @override
+  State<AuthScreen> createState() => _AuthScreenState();
+}
+
+class _AuthScreenState extends State<AuthScreen> {
+  final _emailCtrl = TextEditingController();
+  final _passCtrl = TextEditingController();
+  bool _isLoading = false;
+  bool _isLogin = true;
+
+  Future<void> _submit() async {
+    setState(() => _isLoading = true);
+    try {
+      final email = _emailCtrl.text.trim();
+      final password = _passCtrl.text.trim();
+      if (email.isEmpty || password.isEmpty) throw "Please fill all fields";
+
+      if (_isLogin) {
+        await Supabase.instance.client.auth.signInWithPassword(email: email, password: password);
+      } else {
+        await Supabase.instance.client.auth.signUp(email: email, password: password);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Account Created! You can now login.")));
+          setState(() => _isLogin = true);
+        }
+      }
+    } on AuthException catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message), backgroundColor: Colors.red));
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString()), backgroundColor: Colors.red));
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children:[
+              const Icon(Icons.add_road, size: 80, color: Colors.blueAccent),
+              const SizedBox(height: 20),
+              Text(_isLogin ? "Welcome Back" : "Join Road Sense", style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 30),
+              TextField(controller: _emailCtrl, decoration: const InputDecoration(labelText: "Email", prefixIcon: Icon(Icons.email), border: OutlineInputBorder())),
+              const SizedBox(height: 16),
+              TextField(controller: _passCtrl, obscureText: true, decoration: const InputDecoration(labelText: "Password", prefixIcon: Icon(Icons.lock), border: OutlineInputBorder())),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity, height: 50,
+                child: ElevatedButton(
+                  onPressed: _isLoading ? null : _submit,
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent, foregroundColor: Colors.white),
+                  child: _isLoading ? const CircularProgressIndicator(color: Colors.white) : Text(_isLogin ? "LOGIN" : "SIGN UP"),
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextButton(onPressed: () => setState(() => _isLogin = !_isLogin), child: Text(_isLogin ? "Create an account" : "I already have an account"))
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// --- MAIN COLLECTOR SCREEN ---
 class DataCollectorView extends StatefulWidget {
   final CameraDescription camera;
   const DataCollectorView({super.key, required this.camera});
-
   @override
   State<DataCollectorView> createState() => _DataCollectorViewState();
 }
 
 class _DataCollectorViewState extends State<DataCollectorView> with TickerProviderStateMixin {
   late CameraController _controller;
-
-  // Settings
-  String _targetUrl = "Not Set";
   final TextEditingController _urlCtrl = TextEditingController();
 
-  // State
+  String _targetUrl = "Not Set";
   bool _isReady = false;
   bool _isStreaming = false;
-  String _statusMessage = "Ready to Patrol";
+  String _statusMessage = "Ready";
   Color _statusColor = Colors.grey;
 
-  // Sensor Data (Held in Memory)
-  List<double> _zBuffer = [];
+  List<double> _zBuffer =[];
   double _currentRoughness = 0.0;
 
-  // GPS State
   Position? _currentPosition;
   double _currentSpeedKmh = 0.0;
 
-  // Streams & Timers
   StreamSubscription? _accelSub;
   StreamSubscription? _gpsSub;
   Timer? _uploadTimer;
-
-  // Animation
   late AnimationController _pulseController;
 
   @override
@@ -100,20 +178,16 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
     await _loadTargetUrl();
     await [Permission.camera, Permission.location, Permission.sensors].request();
 
-    // 1. Camera Init
     _controller = CameraController(
         widget.camera,
-        ResolutionPreset.medium, // Balanced for speed/quality
+        ResolutionPreset.medium,
         enableAudio: false,
         imageFormatGroup: Platform.isAndroid ? ImageFormatGroup.jpeg : ImageFormatGroup.bgra8888
     );
 
     try {
       await _controller.initialize();
-
-      // 2. Continuous Sensor Listeners (Non-blocking)
       _startSensors();
-
       setState(() => _isReady = true);
 
       if (_targetUrl == "Not Set") {
@@ -125,28 +199,27 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
   }
 
   void _startSensors() {
-    // IMU
     _accelSub = userAccelerometerEvents.listen((event) {
       _zBuffer.add(event.z);
       if (_zBuffer.length > 200) _zBuffer.removeAt(0);
     });
 
-    // HIGH ACCURACY GPS STREAM
-    // We use a stream so we always have the latest coord ready for the upload timer
     const LocationSettings locationSettings = LocationSettings(
-      accuracy: LocationAccuracy.bestForNavigation, // Highest possible
-      distanceFilter: 2, // Update every 2 meters
+      accuracy: LocationAccuracy.bestForNavigation,
+      distanceFilter: 1, // High accuracy filter
     );
 
     _gpsSub = Geolocator.getPositionStream(locationSettings: locationSettings).listen((Position position) {
+      // Discard highly inaccurate GPS readings to prevent drift
+      if (position.accuracy > 20.0) return;
+
       setState(() {
         _currentPosition = position;
-        _currentSpeedKmh = (position.speed * 3.6); // m/s to km/h
+        _currentSpeedKmh = (position.speed * 3.6);
       });
     });
   }
 
-  // --- SETTINGS ---
   Future<void> _loadTargetUrl() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() => _targetUrl = prefs.getString('target_url') ?? "Not Set");
@@ -171,13 +244,9 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
         content: TextField(
           controller: _urlCtrl,
           style: const TextStyle(color: Colors.white),
-          decoration: const InputDecoration(
-              labelText: "Cloudflare URL or IP:5000",
-              border: OutlineInputBorder(),
-              prefixIcon: Icon(Icons.cloud, color: Colors.blue)
-          ),
+          decoration: const InputDecoration(labelText: "Cloudflare URL or IP:5000", border: OutlineInputBorder()),
         ),
-        actions: [
+        actions:[
           TextButton(child: const Text("SAVE"), onPressed: () {
             if(_urlCtrl.text.isNotEmpty) {
               _saveTargetUrl(_urlCtrl.text.trim());
@@ -189,7 +258,6 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
     );
   }
 
-  // --- LOGIC ---
   void _toggleStreaming() {
     if (_targetUrl == "Not Set") { _showUrlDialog(); return; }
     _isStreaming ? _stopStreaming() : _startStreaming();
@@ -203,8 +271,6 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
       _zBuffer.clear();
     });
 
-    // 3. THROTTLE UPLOAD (2 Seconds)
-    // GPS is already hot, so this just grabs latest data and sends. Fast.
     _uploadTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
       await _captureAndTransmit();
     });
@@ -230,31 +296,32 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
 
   Future<void> _captureAndTransmit() async {
     if (!_controller.value.isInitialized || !_isStreaming || _currentPosition == null) return;
+    if (_currentPosition!.accuracy > 20.0) return; // Safety check
 
     try {
-      // 1. Snapshot Data
       double roughness = _calculateRoughness();
       _currentRoughness = roughness;
 
-      // 2. Capture Image
       XFile imageFile = await _controller.takePicture();
       List<int> bytes = await File(imageFile.path).readAsBytes();
       String base64Img = base64Encode(bytes);
 
-      // 3. Build Payload
+      final user = Supabase.instance.client.auth.currentUser;
+
       Map<String, dynamic> payload = {
         "image": base64Img,
         "gps": {
           "lat": _currentPosition!.latitude,
           "lon": _currentPosition!.longitude,
-          "speed": _currentPosition!.speed
+          "speed": _currentPosition!.speed,
+          "heading": _currentPosition!.heading
         },
         "instance_ip": _targetUrl,
-        "roughness": roughness
+        "roughness": roughness,
+        "user_id": user?.id ?? "anonymous",
+        "user_email": user?.email ?? "anonymous"
       };
 
-      // 4. Send (Fire & Forget Logic)
-      // We set a short timeout so UI doesn't hang on bad connections
       http.post(
         Uri.parse("$_targetUrl/detect"),
         headers: {"Content-Type": "application/json"},
@@ -262,12 +329,8 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
       ).timeout(const Duration(seconds: 5)).then((response) {
         if (response.statusCode == 200) {
           var data = jsonDecode(response.body);
-          if (mounted) {
-            setState(() => _statusMessage = "AI: ${data['status'].toString().toUpperCase()}");
-          }
+          if (mounted) setState(() => _statusMessage = "AI: ${data['status'].toString().toUpperCase()}");
         }
-      }).catchError((e) {
-        debugPrint("Upload Error: $e");
       });
 
       File(imageFile.path).delete();
@@ -275,6 +338,11 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
     } catch (e) {
       debugPrint("Loop Error: $e");
     }
+  }
+
+  Future<void> _logout() async {
+    _stopStreaming();
+    await Supabase.instance.client.auth.signOut();
   }
 
   @override
@@ -296,7 +364,7 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
       appBar: AppBar(
         backgroundColor: Colors.transparent,
         elevation: 0,
-        title: const Text("Road Sense Pro", style: TextStyle(fontWeight: FontWeight.bold)),
+        title: const Text("Road Sense Pro"),
         centerTitle: true,
         flexibleSpace: ClipRect(
           child: BackdropFilter(
@@ -304,37 +372,34 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
             child: Container(color: Colors.black.withOpacity(0.3)),
           ),
         ),
-        actions: [
-          IconButton(icon: const Icon(Icons.map, color: Colors.white), onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const MapScreen()))),
+        actions:[
+          IconButton(
+            icon: const Icon(Icons.map, color: Colors.white),
+            onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const MapScreen())),
+          ),
+          IconButton(icon: const Icon(Icons.logout, color: Colors.redAccent), onPressed: _logout),
           IconButton(icon: const Icon(Icons.settings, color: Colors.white), onPressed: _showUrlDialog)
         ],
       ),
       body: Stack(
         fit: StackFit.expand,
-        children: [
-          // 1. Camera Feed
-          _controller.value.isInitialized
-              ? CameraPreview(_controller)
-              : Container(color: Colors.black),
-
-          // 2. Dark Gradient Overlay (For readability)
+        children:[
+          _controller.value.isInitialized ? CameraPreview(_controller) : Container(color: Colors.black),
           Container(
             decoration: const BoxDecoration(
                 gradient: LinearGradient(
                     begin: Alignment.topCenter, end: Alignment.bottomCenter,
-                    colors: [Colors.black45, Colors.transparent, Colors.transparent, Colors.black87]
+                    colors:[Colors.black45, Colors.transparent, Colors.transparent, Colors.black87]
                 )
             ),
           ),
-
-          // 3. HUD - Speedometer & GPS
           Positioned(
             top: 110, left: 20,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
+              children:[
                 Row(
-                  children: [
+                  children:[
                     const Icon(Icons.speed, color: Colors.cyanAccent, size: 20),
                     const SizedBox(width: 8),
                     Text(
@@ -343,17 +408,22 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
                     ),
                   ],
                 ),
-                const SizedBox(height: 4),
                 Text(
-                  _currentPosition == null ? "Waiting for GPS..." :
-                  "${_currentPosition!.latitude.toStringAsFixed(5)}, ${_currentPosition!.longitude.toStringAsFixed(5)}",
+                  _currentPosition == null ? "Waiting for GPS..." : "${_currentPosition!.latitude.toStringAsFixed(5)}, ${_currentPosition!.longitude.toStringAsFixed(5)}",
                   style: const TextStyle(color: Colors.white70, fontSize: 12),
                 ),
+                const SizedBox(height: 5),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(color: Colors.blueAccent.withOpacity(0.5), borderRadius: BorderRadius.circular(4)),
+                  child: Text(
+                    Supabase.instance.client.auth.currentUser?.email ?? "Unknown",
+                    style: const TextStyle(fontSize: 10, color: Colors.white),
+                  ),
+                )
               ],
             ),
           ),
-
-          // 4. HUD - Roughness Indicator
           Positioned(
             top: 110, right: 20,
             child: Container(
@@ -364,7 +434,7 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
                   border: Border.all(color: Colors.white24)
               ),
               child: Row(
-                children: [
+                children:[
                   Text("Vibration: ", style: TextStyle(color: Colors.grey.shade300, fontSize: 12)),
                   Text(
                     _currentRoughness.toStringAsFixed(1),
@@ -377,8 +447,6 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
               ),
             ),
           ),
-
-          // 5. Bottom Control Panel (Glassmorphism)
           Positioned(
             bottom: 30, left: 20, right: 20,
             child: ClipRRect(
@@ -392,16 +460,12 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
                     border: Border.all(color: Colors.white24),
                   ),
                   child: Column(
-                    children: [
-                      // Status Text
+                    children:[
                       Row(
                         mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
+                        children:[
                           if (_isStreaming)
-                            FadeTransition(
-                              opacity: _pulseController,
-                              child: const Icon(Icons.circle, color: Colors.red, size: 12),
-                            ),
+                            FadeTransition(opacity: _pulseController, child: const Icon(Icons.circle, color: Colors.red, size: 12)),
                           const SizedBox(width: 8),
                           Text(
                             _statusMessage.toUpperCase(),
@@ -410,8 +474,6 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
                         ],
                       ),
                       const SizedBox(height: 16),
-
-                      // Big Button
                       SizedBox(
                         width: double.infinity,
                         height: 55,
@@ -420,16 +482,10 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
                           style: ElevatedButton.styleFrom(
                             backgroundColor: _isStreaming ? Colors.red.shade900 : Colors.cyan.shade800,
                             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-                            elevation: 8,
-                            shadowColor: _isStreaming ? Colors.redAccent.withOpacity(0.5) : Colors.cyan.withOpacity(0.5),
                           ),
-                          child: Text(
-                            _isStreaming ? "STOP PATROL" : "START PATROL",
-                            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white),
-                          ),
+                          child: Text(_isStreaming ? "STOP PATROL" : "START PATROL", style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
                         ),
                       ),
-
                       const SizedBox(height: 8),
                       Text(
                         _targetUrl,
@@ -448,7 +504,7 @@ class _DataCollectorViewState extends State<DataCollectorView> with TickerProvid
   }
 }
 
-// --- FAST MAP SCREEN (No Heatmap, Only Potholes) ---
+// --- MAP SCREEN WITH USER MANAGEMENT ---
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
   @override
@@ -456,8 +512,9 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen> {
-  List<Marker> _markers = [];
+  List<Marker> _markers =[];
   bool _isLoading = true;
+  bool _showOnlyMine = false;
 
   @override
   void initState() {
@@ -466,30 +523,42 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   Future<void> _fetchDetections() async {
+    setState(() => _isLoading = true);
     try {
-      // ONLY fetch actual detections. No road logs. Fast.
-      final detections = await Supabase.instance.client
+      // 1. Setup the base query
+      var query = Supabase.instance.client
           .from('detections')
-          .select('latitude, longitude, image_url, created_at')
-          .order('created_at', ascending: false)
-          .limit(50);
+          .select('id, latitude, longitude, image_url, created_at, severity, user_id');
 
-      List<Marker> newMarkers = [];
+      // 2. Apply filtering first (if needed)
+      if (_showOnlyMine) {
+        final userId = Supabase.instance.client.auth.currentUser!.id;
+        query = query.eq('user_id', userId);
+      }
+
+      // 3. Apply Ordering and Limit last, then execute
+      final detections = await query.order('created_at', ascending: false).limit(500);
+
+      List<Marker> newMarkers =[];
 
       for(var row in (detections as List<dynamic>)) {
+        Color markerColor = Colors.orange;
+        if(row['severity'] == "Severe") markerColor = Colors.red;
+        if(row['severity'] == "Minor") markerColor = Colors.green;
+
         newMarkers.add(Marker(
           point: LatLng(row['latitude'], row['longitude']),
-          width: 45, height: 45,
+          width: 30, height: 30,
           child: GestureDetector(
             onTap: () => _showImage(row),
             child: Container(
               decoration: BoxDecoration(
-                  color: Colors.red.withOpacity(0.9),
+                  color: markerColor.withOpacity(0.9),
                   shape: BoxShape.circle,
-                  border: Border.all(color: Colors.white, width: 2),
-                  boxShadow: const [BoxShadow(color: Colors.black45, blurRadius: 4)]
+                  border: Border.all(color: Colors.white, width: 1.5),
+                  boxShadow: const[BoxShadow(color: Colors.black45, blurRadius: 2)]
               ),
-              child: const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 28),
+              child: const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 16),
             ),
           ),
         ));
@@ -507,15 +576,30 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  Future<void> _deleteDetection(int id) async {
+    try {
+      await Supabase.instance.client.from('detections').delete().eq('id', id);
+      if (mounted) {
+        Navigator.pop(context);
+        _fetchDetections();
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Detection Deleted")));
+      }
+    } catch(e) {
+      debugPrint("Delete Error: $e");
+    }
+  }
+
   void _showImage(Map<String, dynamic> data) {
+    bool isOwner = data['user_id'] == Supabase.instance.client.auth.currentUser?.id;
+
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF1E293B),
-        title: const Text("Confirmed Pothole", style: TextStyle(color: Colors.white)),
+        title: Text("Confirmed ${data['severity']} Pothole", style: const TextStyle(color: Colors.white)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
-          children: [
+          children:[
             Text("Detected: ${data['created_at'].substring(0,10)}", style: const TextStyle(color: Colors.grey)),
             const SizedBox(height: 10),
             ClipRRect(
@@ -530,7 +614,11 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ],
         ),
-        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text("CLOSE"))],
+        actions:[
+          if (isOwner)
+            TextButton(onPressed: () => _deleteDetection(data['id']), child: const Text("DELETE", style: TextStyle(color: Colors.red))),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CLOSE"))
+        ],
       ),
     );
   }
@@ -538,7 +626,24 @@ class _MapScreenState extends State<MapScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text("Pothole Database")),
+      appBar: AppBar(
+        title: const Text("Database"),
+        actions:[
+          Row(
+            children:[
+              const Text("Mine Only", style: TextStyle(fontSize: 12)),
+              Switch(
+                value: _showOnlyMine,
+                activeColor: Colors.blueAccent,
+                onChanged: (val) {
+                  setState(() => _showOnlyMine = val);
+                  _fetchDetections();
+                },
+              ),
+            ],
+          )
+        ],
+      ),
       body: _isLoading
           ? const Center(child: CircularProgressIndicator())
           : FlutterMap(
@@ -547,7 +652,7 @@ class _MapScreenState extends State<MapScreen> {
           initialZoom: 14.0,
           backgroundColor: const Color(0xFF0F172A),
         ),
-        children: [
+        children:[
           TileLayer(
             urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
             userAgentPackageName: 'com.road.sense.pro',
