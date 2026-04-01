@@ -4,7 +4,7 @@
 
 # 🛣️ Road Sense Pro: Autonomous Pothole Detection
 
-**Road Sense Pro** is a hybrid Edge-Cloud civic technology system designed to automate road quality monitoring. It uses a mobile device for sensor data collection (Video + GPS + IMU) and a tethered PC for heavy AI processing (YOLOv8), synchronized via the Cloud.
+**Road Sense Pro** is a hybrid Edge-Cloud civic technology system designed to automate road quality monitoring. It uses a mobile device for sensor data collection (Video + GPS + IMU) and a tethered PC for heavy AI processing RF-DETR, synchronized via the Cloud.
 
 ![Project Status](https://img.shields.io/badge/Status-Active-brightgreen)
 ![Tech Stack](https://img.shields.io/badge/Tech-Flutter%20%7C%20FastAPI%20%7C%20YOLOv8%20%7C%20Supabase-blue)
@@ -12,7 +12,7 @@
 ## 🌟 Key Features
 
 *   **Hybrid Edge-Cloud Architecture:** Offloads heavy AI inference to a local PC/Server while the phone handles data capture.
-*   **Real-Time Pothole Detection:** Uses YOLOv8 to visually detect potholes from the video stream.
+*   **Real-Time Pothole Detection:** Uses RFDETR to visually detect potholes from the video stream.
 *   **Road Roughness Index:** Uses the phone's Accelerometer (IMU) to calculate road vibration/roughness statistics, logging invisible road damage.
 *   **High-Precision GPS:** Implements `bestForNavigation` location tracking for pinpoint accuracy.
 *   **Global Access:** Exposes the local AI server to the internet via **Cloudflare Tunnels**, allowing the mobile app to work on 4G/5G anywhere.
@@ -92,7 +92,7 @@ create policy "Public Insert Logs" on road_logs for insert with check (true);
     ```bash
     pip install fastapi uvicorn python-dotenv supabase ultralytics opencv-python numpy python-multipart
     ```
-3.  Place your trained YOLO model file (e.g., `best.pt`) in the server folder.
+3.  Place your trained RFDETR model file (e.g., `best.pt`) in the server folder.
 4.  Create a `.env` file in the server folder:
     ```ini
     SUPABASE_URL=https://your-project-id.supabase.co
