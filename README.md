@@ -46,7 +46,7 @@
 ### Phase 1: Cloud Database Setup (Supabase)
 
 1.  Create a project at [Supabase.com](https://supabase.com).
-2.  In **SQL Editor**, run the sql commands from ![alt text]supabase-config.sql
+2.  In **SQL Editor**, run the sql commands from [supabase-config.sql](https://github.com/astralranger/road-eye/blob/v1.1/supabase-config.sql)
 
 ---
 
