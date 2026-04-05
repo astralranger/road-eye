@@ -23,7 +23,7 @@
 
 ## 🏗️ System Architecture
 
-![alt text](yoloflow-architecture.png)
+![alt text](System_Architecture_RFDETR.png)
 
 ---
 
