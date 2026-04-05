@@ -101,28 +101,6 @@ If using Colab, run the **Launcher Cell**. It will display a **QR Code**. If loc
 
 ---
 
-## 📋 Requirements (requirements.txt)
-
-```text
-fastapi==0.109.0
-uvicorn==0.27.0
-supabase==2.3.7
-transformers==4.37.2
-torch==2.6.0
-torchvision==0.17.0
-opencv-python==4.9.0.80
-numpy==1.26.4
-rich==13.7.0
-python-dotenv==1.0.1
-scipy==1.12.0
-supervision==0.18.0
-rfdetr>=1.4.0
-qrcode[pil]==7.4.2
-pillow==10.2.0
-```
-
----
-
 ## 🔧 Troubleshooting
 
 | Issue | Solution |
