@@ -1,0 +1,29 @@
+{% set side_links = [
+    { "to": "/dashboard", "label": "Overview" },
+    { "to": "/map", "label": "Hazard Map" },
+    { "to": "/rides", "label": "Ride History" },
+    { "to": "/complaints", "label": "Complaints" }
+] %}
+
+<aside class="sidebar">
+    <p class="sidebar-label">Operations</p>
+
+    <nav class="side-nav" aria-label="Workspace">
+        {% for link in side_links %}
+            {% set is_active = request.path.startswith(link.to) %}
+            <a
+                href="{{ link.to }}"
+                class="{{ 'side-link side-link-active' if is_active else 'side-link' }}"
+                {% if is_active %}aria-current="page"{% endif %}
+            >
+                {{ link.label }}
+            </a>
+        {% endfor %}
+    </nav>
+
+    <section class="sidebar-note">
+        <h4>Shift Reminder</h4>
+        <p>Prioritize unresolved complaints older than 30 minutes.</p>
+    </section>
+</aside>
+

@@ -1,0 +1,68 @@
+{% extends "workspace_base.html" %}
+
+{% block content %}
+    <section class="page">
+        <header class="page-header">
+            <h1>Complaint Desk</h1>
+            <p>Create and track rider issues with clear priority tagging.</p>
+        </header>
+
+        {% if error %}
+            <div class="notice notice-error">
+                <p>{{ error }}</p>
+                <a class="btn btn-ghost" href="{{ request.path }}">Retry</a>
+            </div>
+        {% endif %}
+
+        <div class="complaint-layout">
+            <article class="panel">
+                <h2>Log New Complaint</h2>
+                <form class="complaint-form" method="post" action="/complaints">
+                    <label for="complaint-message">Complaint Details</label>
+                    <textarea
+                        id="complaint-message"
+                        name="message"
+                        placeholder="Describe the issue clearly so an agent can act fast."
+                        rows="4"
+                    >{{ form_message }}</textarea>
+
+                    <label for="complaint-priority">Priority</label>
+                    <select id="complaint-priority" name="priority">
+                        {% for opt in ["Low","Medium","High"] %}
+                            <option {% if opt == form_priority %}selected{% endif %}>{{ opt }}</option>
+                        {% endfor %}
+                    </select>
+
+                    <button class="btn btn-primary" type="submit">Add Complaint</button>
+
+                    {% if submit_error %}
+                        <p class="inline-error">{{ submit_error }}</p>
+                    {% endif %}
+                </form>
+            </article>
+
+            <article class="panel">
+                <h2>Recent Complaints</h2>
+                <ul class="complaint-list">
+                    {% for item in complaints %}
+                        <li>
+                            <div class="complaint-meta">
+                                <span class="pill pill-{{ item.priority|lower }}">
+                                    {{ item.priority }}
+                                </span>
+                                <span>{{ item.time_hm }}</span>
+                            </div>
+                            <p>{{ item.message }}</p>
+                        </li>
+                    {% endfor %}
+                    {% if complaints|length == 0 %}
+                        <li>
+                            <p>No complaints found in Supabase.</p>
+                        </li>
+                    {% endif %}
+                </ul>
+            </article>
+        </div>
+    </section>
+{% endblock %}
+
