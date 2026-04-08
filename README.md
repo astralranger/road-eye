@@ -52,10 +52,7 @@
 
 ### Phase 2: AI Server Setup (Python/Colab)
 
-1.  **Local Setup:** Install requirements:
-    ```bash
-    pip install fastapi uvicorn supabase transformers rfdetr torch torchvision opencv-python rich python-dotenv scikit-learn qrcode[pil]
-    ```
+1.  **Local Setup:** Install the requirements from requirements.txt
 2.  **Checkpoint:** Place your `checkpoint_best_ema.pth` in the `best_saved_model/` folder.
 3.  **Environment:** Create a `.env` file:
     ```ini
