@@ -1,0 +1,31 @@
+{% set links = [
+    { "to": "/", "label": "Home", "end": true },
+    { "to": "/dashboard", "label": "Dashboard" },
+    { "to": "/map", "label": "Map" },
+    { "to": "/rides", "label": "Rides" },
+    { "to": "/complaints", "label": "Complaints" }
+] %}
+
+<header class="navbar">
+    <div class="brand">
+        <span class="brand-badge">RE</span>
+        <div>
+            <p class="brand-title">RoadEye</p>
+            <p class="brand-subtitle">Ride Monitoring Console</p>
+        </div>
+    </div>
+
+    <nav class="top-nav" aria-label="Primary">
+        {% for link in links %}
+            {% set is_active = (request.path == link.to) if link.get("end") else request.path.startswith(link.to) %}
+            <a
+                href="{{ link.to }}"
+                class="{{ 'nav-link nav-link-active' if is_active else 'nav-link' }}"
+                {% if is_active %}aria-current="page"{% endif %}
+            >
+                {{ link.label }}
+            </a>
+        {% endfor %}
+    </nav>
+</header>
+

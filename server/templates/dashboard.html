@@ -1,0 +1,46 @@
+{% extends "workspace_base.html" %}
+
+{% block content %}
+    <section class="page">
+        <header class="page-header">
+            <h1>Operations Overview</h1>
+            <p>Track system health, complaints, and team coverage at a glance.</p>
+        </header>
+
+        {% if error %}
+            <div class="notice notice-error">
+                <p>{{ error }}</p>
+                <a class="btn btn-ghost" href="{{ request.path }}">Retry</a>
+            </div>
+        {% endif %}
+
+        <div class="grid">
+            {% for item in stats %}
+                <article class="card tone-{{ item.tone }}">
+                    <p class="card-title">{{ item.title }}</p>
+                    <h3 class="card-value">{{ item.value }}</h3>
+                    <p class="card-note">{{ item.note }}</p>
+                </article>
+            {% endfor %}
+        </div>
+
+        <section class="panel">
+            <h2>Attention Queue</h2>
+            <ul class="queue-list">
+                <li>
+                    <span class="pill pill-alert">High</span>
+                    {{ complaints_count }} complaint record(s) loaded from the database.
+                </li>
+                <li>
+                    <span class="pill pill-info">Medium</span>
+                    {{ ongoing_rides }} ride(s) are currently ongoing.
+                </li>
+                <li>
+                    <span class="pill pill-good">Low</span>
+                    Data sync completed.
+                </li>
+            </ul>
+        </section>
+    </section>
+{% endblock %}
+

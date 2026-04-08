@@ -1,0 +1,71 @@
+{% extends "workspace_base.html" %}
+
+{% block content %}
+    <section class="page">
+        <header class="page-header">
+            <h1>Ride History</h1>
+            <p>Monitor recent trips and quickly spot rides needing intervention.</p>
+        </header>
+
+        {% if error %}
+            <div class="notice notice-error">
+                <p>{{ error }}</p>
+                <a class="btn btn-ghost" href="{{ request.path }}">Retry</a>
+            </div>
+        {% endif %}
+
+        <div class="summary-row">
+            <article class="summary-chip">
+                <p>Total</p>
+                <strong>{{ total }}</strong>
+            </article>
+            <article class="summary-chip">
+                <p>Completed</p>
+                <strong>{{ completed }}</strong>
+            </article>
+            <article class="summary-chip">
+                <p>Ongoing</p>
+                <strong>{{ ongoing }}</strong>
+            </article>
+            <article class="summary-chip">
+                <p>Cancelled</p>
+                <strong>{{ cancelled }}</strong>
+            </article>
+        </div>
+
+        <div class="table-wrap">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>User</th>
+                        <th>Driver</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for ride in rides %}
+                        <tr>
+                            <td>{{ ride.id }}</td>
+                            <td>{{ ride.user }}</td>
+                            <td>{{ ride.driver }}</td>
+                            <td>
+                                <span class="status-pill {{ ride.status|lower }}">
+                                    {{ ride.status }}
+                                </span>
+                            </td>
+                        </tr>
+                    {% endfor %}
+                    {% if rides|length == 0 %}
+                        <tr>
+                            <td colspan="4" class="empty-state">
+                                No rides found in Supabase.
+                            </td>
+                        </tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+    </section>
+{% endblock %}
+

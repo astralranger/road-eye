@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{{ title or "RoadEye" }}</title>
+        <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+        {% block head %}{% endblock %}
+    </head>
+    <body>
+        {% include "_navbar.html" %}
+        {% block body %}{% endblock %}
+        {% include "_footer.html" %}
+        {% block scripts %}{% endblock %}
+    </body>
+</html>
+

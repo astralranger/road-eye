@@ -23,7 +23,7 @@
 
 ## 🏗️ System Architecture
 
-![alt text](yoloflow-architecture.png)
+![alt text](System_Architecture_RFDETR.png)
 
 ---
 
@@ -52,10 +52,7 @@
 
 ### Phase 2: AI Server Setup (Python/Colab)
 
-1.  **Local Setup:** Install requirements:
-    ```bash
-    pip install fastapi uvicorn supabase transformers rfdetr torch torchvision opencv-python rich python-dotenv scikit-learn qrcode[pil]
-    ```
+1.  **Local Setup:** Install the requirements from requirements.txt
 2.  **Checkpoint:** Place your `checkpoint_best_ema.pth` in the `best_saved_model/` folder.
 3.  **Environment:** Create a `.env` file:
     ```ini
@@ -98,28 +95,6 @@ If using Colab, run the **Launcher Cell**. It will display a **QR Code**. If loc
 2.  The app captures data every 2 seconds.
 3.  The server runs the **Segformer mask**, applies the **ROI Split-line**, and executes **RF-DETR**.
 4.  Confirmed potholes are scored via **Canny Edge Detection** (Minor/Moderate/Severe).
-
----
-
-## 📋 Requirements (requirements.txt)
-
-```text
-fastapi==0.109.0
-uvicorn==0.27.0
-supabase==2.3.7
-transformers==4.37.2
-torch==2.6.0
-torchvision==0.17.0
-opencv-python==4.9.0.80
-numpy==1.26.4
-rich==13.7.0
-python-dotenv==1.0.1
-scipy==1.12.0
-supervision==0.18.0
-rfdetr>=1.4.0
-qrcode[pil]==7.4.2
-pillow==10.2.0
-```
 
 ---
 

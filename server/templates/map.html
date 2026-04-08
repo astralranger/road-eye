@@ -1,0 +1,84 @@
+{% extends "workspace_base.html" %}
+
+{% block head %}
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet/leaflet.css') }}" />
+{% endblock %}
+
+{% block content %}
+    <section class="page">
+        <header class="page-header">
+            <h1>Road Hazard Map</h1>
+            <p>Track potholes, rough patches, and smooth segments from live road logs.</p>
+        </header>
+
+        {% if error %}
+            <div class="notice notice-error">
+                <p>{{ error }}</p>
+                <a class="btn btn-ghost" href="{{ request.path }}">Retry</a>
+            </div>
+        {% endif %}
+
+        <div class="summary-row">
+            <article class="summary-chip">
+                <p>Total Points</p>
+                <strong>{{ total_points }}</strong>
+            </article>
+            <article class="summary-chip">
+                <p>Potholes</p>
+                <strong>{{ counts.pothole }}</strong>
+            </article>
+            <article class="summary-chip">
+                <p>Rough Patches</p>
+                <strong>{{ counts.rough }}</strong>
+            </article>
+            <article class="summary-chip">
+                <p>Smooth</p>
+                <strong>{{ counts.smooth }}</strong>
+            </article>
+        </div>
+
+        <div class="map-layout">
+            <article class="panel map-panel">
+                <div class="map-legend">
+                    <span class="legend-pill legend-pothole">Pothole</span>
+                    <span class="legend-pill legend-rough">Rough Patch</span>
+                    <span class="legend-pill legend-smooth">Smooth</span>
+                    <span class="legend-pill legend-unknown">Unclassified</span>
+                </div>
+
+                {% if points|length == 0 %}
+                    <p class="empty-state map-empty">No geolocation data found in ride logs.</p>
+                {% else %}
+                    <div id="hazard-map" class="hazard-map"></div>
+                    <script id="points-data" type="application/json">{{ points|tojson }}</script>
+                {% endif %}
+            </article>
+
+            <article class="panel map-feed">
+                <h2>Recent Hazard Feed</h2>
+                <ul class="hazard-list">
+                    {% for point in sorted_points[:12] %}
+                        <li>
+                            <span class="pill pill-{{ point.severity }}">
+                                {{ point.severity_label }}
+                            </span>
+                            <span>Roughness {{ point.roughness_fmt }}</span>
+                            <span>{{ point.timestamp_fmt }}</span>
+                        </li>
+                    {% endfor %}
+                    {% if sorted_points|length == 0 %}
+                        <li>
+                            <span>No hazard events available.</span>
+                        </li>
+                    {% endif %}
+                </ul>
+            </article>
+        </div>
+    </section>
+{% endblock %}
+
+{% block scripts %}
+    <script src="{{ url_for('static', filename='vendor/leaflet/leaflet.js') }}"></script>
+    <script src="{{ url_for('static', filename='map.js') }}"></script>
+{% endblock %}
+
