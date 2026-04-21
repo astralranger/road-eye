@@ -9,6 +9,33 @@ function isComplaintResolved(complaint) {
 export default function Dashboard() {
     const { rides, complaints, isLoading, error, refresh } = useRoadEyeData();
 
+    // 🔥 NEW: Loading UI (proper handling)
+    if (isLoading) {
+        return (
+            <section className="page">
+                <p>⏳ Loading dashboard data...</p>
+            </section>
+        );
+    }
+
+    // 🔥 NEW: Error UI (already tha, but now cleaner)
+    if (error) {
+        return (
+            <section className="page">
+                <div className="notice notice-error">
+                    <p>⚠️ {error}</p>
+                    <button
+                        type="button"
+                        className="btn btn-ghost"
+                        onClick={refresh}
+                    >
+                        Retry
+                    </button>
+                </div>
+            </section>
+        );
+    }
+
     const resolvedCount = complaints.filter(isComplaintResolved).length;
     const activeAgents = new Set(
         rides
@@ -32,7 +59,9 @@ export default function Dashboard() {
         {
             title: "Resolved",
             value: resolvedCount.toLocaleString(),
-            note: complaints.length ? `${Math.round((resolvedCount / complaints.length) * 100)}% resolved` : "No complaints yet",
+            note: complaints.length
+                ? `${Math.round((resolvedCount / complaints.length) * 100)}% resolved`
+                : "No complaints yet",
             tone: "good"
         },
         {
@@ -49,15 +78,6 @@ export default function Dashboard() {
                 <h1>Operations Overview</h1>
                 <p>Track system health, complaints, and team coverage at a glance.</p>
             </header>
-
-            {error && (
-                <div className="notice notice-error">
-                    <p>{error}</p>
-                    <button type="button" className="btn btn-ghost" onClick={refresh}>
-                        Retry
-                    </button>
-                </div>
-            )}
 
             <div className="grid">
                 {stats.map((item) => (
@@ -80,12 +100,16 @@ export default function Dashboard() {
                     </li>
                     <li>
                         <span className="pill pill-info">Medium</span>
-                        {rides.filter((ride) => String(ride.status).toLowerCase() === "ongoing").length}
-                        {" "}ride(s) are currently ongoing.
+                        {
+                            rides.filter(
+                                (ride) => String(ride.status).toLowerCase() === "ongoing"
+                            ).length
+                        }{" "}
+                        ride(s) are currently ongoing.
                     </li>
                     <li>
                         <span className="pill pill-good">Low</span>
-                        {isLoading ? "Refreshing data..." : "Data sync completed."}
+                        Data sync completed.
                     </li>
                 </ul>
             </section>
