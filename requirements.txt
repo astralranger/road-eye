@@ -98,3 +98,4 @@ supervision==0.18.0
 rfdetr>=1.4.0
 qrcode[pil]==7.4.2
 pillow==10.2.0
+fpdf2
