@@ -24,6 +24,7 @@
 ## 🏗️ System Architecture
 
 ![alt text](System_Architecture_RFDETR.png)
+![alt text](app-ui.jpg)
 
 ---
 
