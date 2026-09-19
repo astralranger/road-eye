@@ -12,7 +12,7 @@ class UrlHelper {
 
     // If no scheme is provided, prepend http:// or https:// appropriately
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
-      if (url.contains('.trycloudflare.com') || url.contains('.workers.dev')) {
+      if (url.contains('.trycloudflare.com') || url.contains('.workers.dev') || url.contains('.ts.net')) {
         url = 'https://$url';
       } else {
         url = 'http://$url';
@@ -40,5 +40,19 @@ class UrlHelper {
     final sanitized = sanitize(baseUrl);
     if (!isValidUrl(sanitized)) return null;
     return Uri.tryParse('$sanitized/detect');
+  }
+
+  /// Constructs the /health endpoint URI safely.
+  static Uri? getHealthUri(String baseUrl) {
+    final sanitized = sanitize(baseUrl);
+    if (!isValidUrl(sanitized)) return null;
+    return Uri.tryParse('$sanitized/health');
+  }
+
+  /// Constructs the /api/v1/spatial/upload endpoint URI safely.
+  static Uri? getUploadUri(String baseUrl) {
+    final sanitized = sanitize(baseUrl);
+    if (!isValidUrl(sanitized)) return null;
+    return Uri.tryParse('$sanitized/api/v1/spatial/upload');
   }
 }

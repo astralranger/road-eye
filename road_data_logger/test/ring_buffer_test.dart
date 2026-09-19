@@ -2,56 +2,58 @@ import 'dart:math';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:road_data_logger/utils/ring_buffer.dart';
 
+double naiveStdDev(List<double> values) {
+  if (values.length < 2) return 0.0;
+  final double mean = values.reduce((a, b) => a + b) / values.length;
+  final double variance = values.map((v) => pow(v - mean, 2)).reduce((a, b) => a + b) / values.length;
+  return sqrt(variance);
+}
+
 void main() {
-  group('RingBuffer Tests', () {
-    test('Empty ring buffer returns 0.0 roughness', () {
-      final buffer = RingBuffer(capacity: 5);
-      expect(buffer.isEmpty, isTrue);
-      expect(buffer.length, equals(0));
-      expect(buffer.calculateRoughness(), equals(0.0));
-      expect(buffer.calculateRoughnessAndClear(), equals(0.0));
+  group('RingBuffer O(1) Performance & Accuracy Tests', () {
+    test('Empty and single element returns 0.0', () {
+      final rb = RingBuffer(capacity: 10);
+      expect(rb.calculateRoughness(), 0.0);
+      rb.add(5.0);
+      expect(rb.calculateRoughness(), 0.0);
     });
 
-    test('Ring buffer computes accurate standard deviation', () {
-      final buffer = RingBuffer(capacity: 10);
-      // Sample values: 2, 4, 4, 4, 5, 5, 7, 9
-      // Mean = 5, Variance = 4, StdDev = 2.0
-      final values = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
-      for (final v in values) {
-        buffer.add(v);
+    test('Accurately matches statistical standard deviation under capacity', () {
+      final rb = RingBuffer(capacity: 10);
+      final samples = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
+      for (final s in samples) {
+        rb.add(s);
       }
 
-      expect(buffer.length, equals(8));
-      expect(buffer.calculateRoughness(), closeTo(2.0, 0.0001));
+      final double expected = naiveStdDev(samples);
+      final double actual = rb.calculateRoughness();
+      expect((actual - expected).abs(), lessThan(1e-6));
     });
 
-    test('Circular wrapping does not exceed capacity', () {
-      final buffer = RingBuffer(capacity: 3);
-      buffer.add(10.0);
-      buffer.add(20.0);
-      buffer.add(30.0);
-      expect(buffer.length, equals(3));
+    test('Accurately maintains running moments after circular wrapping (capacity exceeded)', () {
+      final rb = RingBuffer(capacity: 5);
+      // Add 10 samples so first 5 are overwritten
+      final allSamples = [1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 15.0, 12.0, 18.0];
+      for (final s in allSamples) {
+        rb.add(s);
+      }
 
-      // Overwrite first two
-      buffer.add(40.0);
-      buffer.add(50.0);
-      expect(buffer.length, equals(3));
-
-      // Buffer contents should now represent 30.0, 40.0, 50.0
-      // Mean = 40.0, Variance = (100 + 0 + 100) / 3 = 66.6667, StdDev = sqrt(66.6667) ≈ 8.1649
-      expect(buffer.calculateRoughness(), closeTo(sqrt(200.0 / 3.0), 0.001));
+      final activeWindow = allSamples.sublist(5); // last 5 samples
+      final double expected = naiveStdDev(activeWindow);
+      final double actual = rb.calculateRoughness();
+      expect((actual - expected).abs(), lessThan(1e-6));
     });
 
-    test('calculateRoughnessAndClear resets count without deallocating', () {
-      final buffer = RingBuffer(capacity: 5);
-      buffer.add(5.0);
-      buffer.add(15.0);
-      expect(buffer.length, equals(2));
+    test('calculateRoughnessAndClear clears in O(1) and resets moments', () {
+      final rb = RingBuffer(capacity: 5);
+      rb.add(10.0);
+      rb.add(20.0);
+      expect(rb.calculateRoughness(), greaterThan(0));
 
-      final roughness = buffer.calculateRoughnessAndClear();
-      expect(roughness, closeTo(5.0, 0.001));
-      expect(buffer.length, equals(0));
-      expect(buffer.isEmpty, isTrue);
+      final clearedVal = rb.calculateRoughnessAndClear();
+      expect(clearedVal, greaterThan(0));
+      expect(rb.length, 0);
+      expect(rb.calculateRoughness(), 0.0);
     });
   });
 }

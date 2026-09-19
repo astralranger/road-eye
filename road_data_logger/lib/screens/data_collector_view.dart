@@ -1,16 +1,25 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../config/app_config.dart';
+import '../models/spatial_video_report.dart';
 import '../models/telemetry_payload.dart';
 import '../services/api_service.dart';
 import '../services/camera_service.dart';
 import '../services/sensor_service.dart';
+import '../services/spatial_queue_service.dart';
+import '../services/spatial_security_service.dart';
 import '../theme/uber_theme.dart';
+import '../utils/mp4_validator.dart';
 import '../utils/url_helper.dart';
+import '../utils/uuid_helper.dart';
+import 'account_screen.dart';
 import 'map_screen.dart';
+
+enum CaptureMode { patrolStream, spatialVideo }
 
 class DataCollectorView extends StatefulWidget {
   final CameraDescription? camera;
@@ -25,12 +34,20 @@ class _DataCollectorViewState extends State<DataCollectorView>
   final CameraService _cameraService = CameraService();
   final SensorService _sensorService = SensorService();
   final ApiService _apiService = ApiService();
+  final SpatialSecurityService _spatialSecurityService = SpatialSecurityService();
+  final SpatialQueueService _spatialQueueService = SpatialQueueService();
 
   final TextEditingController _urlCtrl = TextEditingController();
 
+  CaptureMode _selectedMode = CaptureMode.patrolStream;
   String _targetUrl = "Not Set";
   bool _isSystemReady = false;
   bool _isStreaming = false;
+
+  // Spatial Video state
+  bool _isRecordingSpatialVideo = false;
+  int _spatialRecordingSeconds = 0;
+  Timer? _spatialRecordTimer;
 
   final ValueNotifier<String> _statusMessageNotifier = ValueNotifier<String>("Ready");
   final ValueNotifier<Color> _statusColorNotifier = ValueNotifier<Color>(UberColors.textSecondary);
@@ -52,10 +69,12 @@ class _DataCollectorViewState extends State<DataCollectorView>
   @override
   void dispose() {
     _stopStreaming(notify: false);
+    _spatialRecordTimer?.cancel();
     _pulseController.dispose();
     _cameraService.dispose();
     _sensorService.dispose();
     _apiService.dispose();
+    _spatialSecurityService.dispose();
     _urlCtrl.dispose();
     _statusMessageNotifier.dispose();
     _statusColorNotifier.dispose();
@@ -66,7 +85,7 @@ class _DataCollectorViewState extends State<DataCollectorView>
     await _loadTargetUrl();
 
     try {
-      await [Permission.camera, Permission.location].request();
+      await [Permission.camera, Permission.location, Permission.microphone].request();
     } catch (e) {
       debugPrint("Permission request warning: $e");
     }
@@ -171,6 +190,10 @@ class _DataCollectorViewState extends State<DataCollectorView>
     _statusColorNotifier.value = color;
   }
 
+  // ==========================================
+  // PATROL STREAMING LOGIC
+  // ==========================================
+
   void _toggleStreaming() {
     if (_targetUrl == "Not Set" || !UrlHelper.isValidUrl(_targetUrl)) {
       _showUrlDialog();
@@ -269,12 +292,206 @@ class _DataCollectorViewState extends State<DataCollectorView>
     }
   }
 
+  // ==========================================
+  // SPATIAL VIDEO RECORDING LOGIC
+  // ==========================================
+
+  Future<void> _toggleSpatialRecording() async {
+    if (_isRecordingSpatialVideo) {
+      await _stopSpatialRecording();
+    } else {
+      await _startSpatialRecording();
+    }
+  }
+
+  Future<void> _startSpatialRecording() async {
+    if (!_cameraService.isInitialized) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Camera hardware not available for video recording."),
+          backgroundColor: UberColors.red,
+        ),
+      );
+      return;
+    }
+
+    try {
+      final tempDir = Directory.systemTemp;
+      final tempPath = '${tempDir.path}/temp_rec_${DateTime.now().millisecondsSinceEpoch}.mp4';
+
+      // Mark recording in progress for crash recovery resilience
+      await SpatialQueueService.markRecordingStarted(tempPath);
+
+      final started = await _cameraService.startVideoRecording();
+      if (!started) {
+        await SpatialQueueService.markRecordingFinished();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("Failed to start hardware video recording."),
+              backgroundColor: UberColors.red,
+            ),
+          );
+        }
+        return;
+      }
+
+      await _spatialSecurityService.startSecurityTrail();
+
+      setState(() {
+        _isRecordingSpatialVideo = true;
+        _spatialRecordingSeconds = 0;
+      });
+
+      _pulseController.repeat(reverse: true);
+      _updateStatus("RECORDING SPATIAL BURST", UberColors.red);
+
+      _spatialRecordTimer?.cancel();
+      _spatialRecordTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+        if (!mounted) return;
+        setState(() {
+          _spatialRecordingSeconds++;
+        });
+
+        // Safe automatic cap at 90 seconds to prevent storage exhaustion
+        if (_spatialRecordingSeconds >= 90) {
+          _stopSpatialRecording();
+        }
+      });
+    } catch (e) {
+      debugPrint("startSpatialRecording error: $e");
+      await SpatialQueueService.markRecordingFinished();
+      setState(() => _isRecordingSpatialVideo = false);
+      _pulseController.stop();
+    }
+  }
+
+  Future<void> _stopSpatialRecording() async {
+    if (!_isRecordingSpatialVideo) return;
+
+    _spatialRecordTimer?.cancel();
+    _spatialRecordTimer = null;
+
+    setState(() => _isRecordingSpatialVideo = false);
+    _pulseController.stop();
+    _updateStatus("FINALIZING SPATIAL REPORT...", UberColors.amber);
+
+    try {
+      final XFile? videoXFile = await _cameraService.stopVideoRecording();
+      if (videoXFile == null) {
+        await SpatialQueueService.markRecordingFinished();
+        _updateStatus("Recording Cancelled", UberColors.textSecondary);
+        return;
+      }
+
+      final int durationMs = _spatialRecordingSeconds * 1000;
+      final file = File(videoXFile.path);
+      final int fileSizeBytes = await file.length();
+
+      if (durationMs < 1500 || fileSizeBytes == 0) {
+        await file.delete().catchError((_) => file);
+        await SpatialQueueService.markRecordingFinished();
+        _updateStatus("Recording discarded (burst < 1.5s)", UberColors.amber);
+        return;
+      }
+
+      final user = AppConfig.currentUser;
+      final String userId = user?.id ?? "anonymous_${DateTime.now().millisecondsSinceEpoch}";
+      final String userEmail = user?.email ?? "anonymous@roadsense.local";
+
+      final securityResult = await _spatialSecurityService.stopSecurityTrail(
+        userId: userId,
+        durationMs: durationMs,
+        fileSizeBytes: fileSizeBytes,
+      );
+
+      // Persist video file in local spatial video directory with container atom validation
+      final destDir = _spatialQueueService.videoDirectory;
+      final reportId = UuidHelper.generateV4();
+      final videoFilename = 'spatial_${DateTime.now().millisecondsSinceEpoch}.mp4';
+      final targetPath = '${destDir.path}/$videoFilename';
+
+      final bool persisted = await Mp4Validator.safelyFinalizeAndPersist(file, targetPath);
+      if (!persisted) {
+        await SpatialQueueService.markRecordingFinished();
+        _updateStatus("Recording discarded (moov container error)", UberColors.red);
+        return;
+      }
+
+      // Clear crash recovery flag
+      await SpatialQueueService.markRecordingFinished();
+
+      final report = SpatialVideoReport(
+        id: reportId,
+        userId: userId,
+        userEmail: userEmail,
+        recordedAt: DateTime.now(),
+        durationMs: durationMs,
+        resolution: '1280x720',
+        fileSizeBytes: fileSizeBytes,
+        localVideoPath: targetPath,
+        videoFilename: videoFilename,
+        storageStatus: 'local_only',
+        checksumSha256: securityResult.checksumSha256,
+        pointCount: securityResult.pointCount,
+        startLat: securityResult.startLat,
+        startLon: securityResult.startLon,
+        endLat: securityResult.endLat,
+        endLon: securityResult.endLon,
+        distanceMeters: securityResult.distanceMeters,
+        avgSpeedKmh: securityResult.avgSpeedKmh,
+        gpsTrail: securityResult.trail,
+        isTamperVerified: securityResult.isTamperVerified,
+        splatStatus: 'queued',
+        syncStatus: SyncStatus.pending,
+      );
+
+      await _spatialQueueService.enqueueReport(report);
+
+      _updateStatus("Saved (${securityResult.pointCount} pts)", UberColors.green);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              "Spatial video logged! ${securityResult.pointCount} GPS pts locked. SHA-256 verified.",
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+            backgroundColor: UberColors.surfaceElevated,
+            duration: const Duration(seconds: 4),
+            action: SnackBarAction(
+              label: "VIEW",
+              textColor: UberColors.white,
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const AccountScreen()),
+                );
+              },
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint("stopSpatialRecording error: $e");
+      await SpatialQueueService.markRecordingFinished();
+      _updateStatus("Error saving spatial burst", UberColors.red);
+    }
+  }
+
   Future<void> _logout() async {
     _stopStreaming();
+    if (_isRecordingSpatialVideo) {
+      await _stopSpatialRecording();
+    }
     if (AppConfig.isSupabaseInitialized) {
       await AppConfig.supabase.auth.signOut();
     }
   }
+
+  // ==========================================
+  // UI BUILD
+  // ==========================================
 
   @override
   Widget build(BuildContext context) {
@@ -311,9 +528,9 @@ class _DataCollectorViewState extends State<DataCollectorView>
                             child: const Icon(Icons.videocam_off_outlined, size: 32, color: UberColors.textSecondary),
                           ),
                           const SizedBox(height: 16),
-                          const Text("Camera Off • Simulation Mode", style: UberTypography.title),
+                          const Text("Camera Off • Telemetry Mode", style: UberTypography.title),
                           const SizedBox(height: 4),
-                          const Text("Accelerometer & GPS telemetry logging is active", style: TextStyle(color: UberColors.textTertiary, fontSize: 12)),
+                          const Text("Accelerometer & GPS logging active", style: TextStyle(color: UberColors.textTertiary, fontSize: 12)),
                         ],
                       ),
                     ),
@@ -341,7 +558,7 @@ class _DataCollectorViewState extends State<DataCollectorView>
             ),
           ),
 
-          // 3. Anchored Top Navigation & Telemetry Card
+          // 3. Anchored Top Navigation & Mode Switcher
           Positioned(
             top: 0,
             left: 0,
@@ -371,12 +588,16 @@ class _DataCollectorViewState extends State<DataCollectorView>
                                 height: 8,
                                 decoration: BoxDecoration(
                                   shape: BoxShape.circle,
-                                  color: _isStreaming ? UberColors.green : UberColors.textTertiary,
+                                  color: (_isStreaming || _isRecordingSpatialVideo)
+                                      ? (_isRecordingSpatialVideo ? UberColors.red : UberColors.green)
+                                      : UberColors.textTertiary,
                                 ),
                               ),
                               const SizedBox(width: 8),
                               Text(
-                                _isStreaming ? "PATROL ACTIVE" : "ROAD SENSE",
+                                _isRecordingSpatialVideo
+                                    ? "REC SPATIAL"
+                                    : (_isStreaming ? "PATROL ACTIVE" : "ROAD SENSE"),
                                 style: UberTypography.caption.copyWith(
                                   color: UberColors.textPrimary,
                                   fontWeight: FontWeight.w800,
@@ -386,6 +607,17 @@ class _DataCollectorViewState extends State<DataCollectorView>
                           ),
                         ),
                         const Spacer(),
+
+                        // Account & Spatial Reports View
+                        _buildHeaderIconButton(
+                          icon: Icons.person_outline_rounded,
+                          tooltip: "Account & Reports",
+                          onTap: () => Navigator.push(
+                            context,
+                            MaterialPageRoute(builder: (_) => const AccountScreen()),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
 
                         // Map Button
                         _buildHeaderIconButton(
@@ -417,87 +649,15 @@ class _DataCollectorViewState extends State<DataCollectorView>
                     ),
                   ),
 
-                  // Floating HUD Telemetry Card (Speed & Vibration)
+                  // Mode Switcher Pill Toggle
+                  _buildModeSelector(),
+
+                  // Floating HUD Telemetry Card (Speed/Vibration OR Spatial GPS Lock)
                   Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-                      decoration: BoxDecoration(
-                        color: UberColors.surface.withValues(alpha: 0.95),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: UberColors.border),
-                      ),
-                      child: Row(
-                        children: [
-                          // Speedometer
-                          Expanded(
-                            flex: 3,
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text("SPEED", style: UberTypography.caption.copyWith(fontSize: 10)),
-                                const SizedBox(height: 2),
-                                ValueListenableBuilder<double>(
-                                  valueListenable: _sensorService.speedKmhNotifier,
-                                  builder: (_, speed, __) => Row(
-                                    crossAxisAlignment: CrossAxisAlignment.baseline,
-                                    textBaseline: TextBaseline.alphabetic,
-                                    children: [
-                                      Text(
-                                        speed.toStringAsFixed(0),
-                                        style: UberTypography.display.copyWith(fontSize: 32),
-                                      ),
-                                      const SizedBox(width: 4),
-                                      const Text("KM/H", style: TextStyle(color: UberColors.textSecondary, fontSize: 12, fontWeight: FontWeight.bold)),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-
-                          Container(width: 1, height: 36, color: UberColors.border),
-
-                          // Vibration Roughness
-                          Expanded(
-                            flex: 3,
-                            child: Padding(
-                              padding: const EdgeInsets.only(left: 16),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text("VIBRATION", style: UberTypography.caption.copyWith(fontSize: 10)),
-                                  const SizedBox(height: 2),
-                                  ValueListenableBuilder<double>(
-                                    valueListenable: _sensorService.roughnessNotifier,
-                                    builder: (_, roughness, __) => Row(
-                                      children: [
-                                        Container(
-                                          width: 8,
-                                          height: 8,
-                                          decoration: BoxDecoration(
-                                            shape: BoxShape.circle,
-                                            color: roughness > 1.5 ? UberColors.red : UberColors.green,
-                                          ),
-                                        ),
-                                        const SizedBox(width: 6),
-                                        Text(
-                                          roughness.toStringAsFixed(1),
-                                          style: UberTypography.display.copyWith(
-                                            fontSize: 22,
-                                            color: roughness > 1.5 ? UberColors.red : UberColors.textPrimary,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
+                    child: _selectedMode == CaptureMode.patrolStream
+                        ? _buildPatrolHudCard()
+                        : _buildSpatialHudCard(),
                   ),
                 ],
               ),
@@ -552,7 +712,7 @@ class _DataCollectorViewState extends State<DataCollectorView>
                           ),
                           child: Row(
                             children: [
-                              if (_isStreaming)
+                              if (_isStreaming || _isRecordingSpatialVideo)
                                 FadeTransition(
                                   opacity: _pulseController,
                                   child: Container(
@@ -586,54 +746,12 @@ class _DataCollectorViewState extends State<DataCollectorView>
                       ),
                       const SizedBox(height: 14),
 
-                      // High-Density Telemetry Info Row
-                      Row(
-                        children: [
-                          // GPS Coords
-                          Expanded(
-                            child: ValueListenableBuilder(
-                              valueListenable: _sensorService.positionNotifier,
-                              builder: (_, pos, __) => Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text("GPS COORDINATES", style: UberTypography.caption.copyWith(fontSize: 10)),
-                                  const SizedBox(height: 3),
-                                  Text(
-                                    pos == null
-                                        ? "Acquiring..."
-                                        : "${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)}",
-                                    style: const TextStyle(color: UberColors.textPrimary, fontSize: 13, fontWeight: FontWeight.w600),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
+                      // High-Density Context Info Row
+                      if (_selectedMode == CaptureMode.patrolStream)
+                        _buildPatrolBottomInfo()
+                      else
+                        _buildSpatialBottomInfo(),
 
-                          // Node Info
-                          Expanded(
-                            child: InkWell(
-                              onTap: _showUrlDialog,
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text("TARGET NODE", style: UberTypography.caption.copyWith(fontSize: 10)),
-                                  const SizedBox(height: 3),
-                                  Text(
-                                    _targetUrl == "Not Set" ? "Tap to configure" : UrlHelper.toDisplayString(_targetUrl),
-                                    style: const TextStyle(
-                                      color: UberColors.blue,
-                                      fontSize: 13,
-                                      fontWeight: FontWeight.w600,
-                                      decoration: TextDecoration.underline,
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
                       const SizedBox(height: 18),
 
                       // Full-Width Uber High-Impact CTA Button
@@ -641,20 +759,48 @@ class _DataCollectorViewState extends State<DataCollectorView>
                         width: double.infinity,
                         height: 54,
                         child: ElevatedButton(
-                          onPressed: _toggleStreaming,
+                          onPressed: _selectedMode == CaptureMode.patrolStream
+                              ? _toggleStreaming
+                              : _toggleSpatialRecording,
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: _isStreaming ? UberColors.red : UberColors.white,
-                            foregroundColor: _isStreaming ? UberColors.white : UberColors.black,
+                            backgroundColor: (_selectedMode == CaptureMode.patrolStream && _isStreaming) ||
+                                    (_selectedMode == CaptureMode.spatialVideo && _isRecordingSpatialVideo)
+                                ? UberColors.red
+                                : UberColors.white,
+                            foregroundColor: (_selectedMode == CaptureMode.patrolStream && _isStreaming) ||
+                                    (_selectedMode == CaptureMode.spatialVideo && _isRecordingSpatialVideo)
+                                ? UberColors.white
+                                : UberColors.black,
                             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                             elevation: 0,
                           ),
-                          child: Text(
-                            _isStreaming ? "STOP PATROL" : "START PATROL",
-                            style: const TextStyle(
-                              fontSize: 15,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: 0.8,
-                            ),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              if (_selectedMode == CaptureMode.spatialVideo && !_isRecordingSpatialVideo) ...[
+                                Container(
+                                  width: 12,
+                                  height: 12,
+                                  decoration: const BoxDecoration(
+                                    color: UberColors.red,
+                                    shape: BoxShape.circle,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                              ],
+                              Text(
+                                _selectedMode == CaptureMode.patrolStream
+                                    ? (_isStreaming ? "STOP PATROL" : "START PATROL")
+                                    : (_isRecordingSpatialVideo
+                                        ? "STOP & SAVE SPATIAL BURST"
+                                        : "RECORD SPATIAL VIDEO"),
+                                style: const TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w800,
+                                  letterSpacing: 0.8,
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ),
@@ -666,6 +812,417 @@ class _DataCollectorViewState extends State<DataCollectorView>
           ),
         ],
       ),
+    );
+  }
+
+  // ==========================================
+  // COMPONENT BUILDERS
+  // ==========================================
+
+  Widget _buildModeSelector() {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: UberColors.surface.withValues(alpha: 0.95),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: UberColors.border),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: _buildModeTab(
+              title: "PATROL INFERENCE",
+              icon: Icons.radar,
+              isSelected: _selectedMode == CaptureMode.patrolStream,
+              onTap: () {
+                if (_isRecordingSpatialVideo) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text("Stop spatial video recording before switching mode."),
+                      backgroundColor: UberColors.amber,
+                    ),
+                  );
+                  return;
+                }
+                setState(() {
+                  _selectedMode = CaptureMode.patrolStream;
+                  _updateStatus(
+                    _isStreaming ? "Patrol Active" : "Ready",
+                    _isStreaming ? UberColors.green : UberColors.textSecondary,
+                  );
+                });
+              },
+            ),
+          ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: _buildModeTab(
+              title: "3D SPATIAL VIDEO",
+              icon: Icons.view_in_ar_rounded,
+              isSelected: _selectedMode == CaptureMode.spatialVideo,
+              onTap: () {
+                if (_isStreaming) {
+                  _stopStreaming();
+                }
+                setState(() {
+                  _selectedMode = CaptureMode.spatialVideo;
+                  _updateStatus(
+                    _isRecordingSpatialVideo
+                        ? "Recording Spatial Burst"
+                        : "Spatial Ready (Local-First)",
+                    _isRecordingSpatialVideo ? UberColors.red : UberColors.white,
+                  );
+                });
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildModeTab({
+    required String title,
+    required IconData icon,
+    required bool isSelected,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        decoration: BoxDecoration(
+          color: isSelected ? UberColors.surfaceElevated : Colors.transparent,
+          borderRadius: BorderRadius.circular(8),
+          border: isSelected ? Border.all(color: UberColors.border) : null,
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              icon,
+              size: 14,
+              color: isSelected ? UberColors.white : UberColors.textTertiary,
+            ),
+            const SizedBox(width: 6),
+            Text(
+              title,
+              style: TextStyle(
+                color: isSelected ? UberColors.white : UberColors.textSecondary,
+                fontSize: 11,
+                fontWeight: isSelected ? FontWeight.w800 : FontWeight.w600,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPatrolHudCard() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+      decoration: BoxDecoration(
+        color: UberColors.surface.withValues(alpha: 0.95),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: UberColors.border),
+      ),
+      child: Row(
+        children: [
+          // Speedometer
+          Expanded(
+            flex: 3,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("SPEED", style: UberTypography.caption.copyWith(fontSize: 10)),
+                const SizedBox(height: 2),
+                ValueListenableBuilder<double>(
+                  valueListenable: _sensorService.speedKmhNotifier,
+                  builder: (_, speed, __) => Row(
+                    crossAxisAlignment: CrossAxisAlignment.baseline,
+                    textBaseline: TextBaseline.alphabetic,
+                    children: [
+                      Text(
+                        speed.toStringAsFixed(0),
+                        style: UberTypography.display.copyWith(fontSize: 32),
+                      ),
+                      const SizedBox(width: 4),
+                      const Text("KM/H", style: TextStyle(color: UberColors.textSecondary, fontSize: 12, fontWeight: FontWeight.bold)),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          Container(width: 1, height: 36, color: UberColors.border),
+
+          // Vibration Roughness
+          Expanded(
+            flex: 3,
+            child: Padding(
+              padding: const EdgeInsets.only(left: 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("VIBRATION", style: UberTypography.caption.copyWith(fontSize: 10)),
+                  const SizedBox(height: 2),
+                  ValueListenableBuilder<double>(
+                    valueListenable: _sensorService.roughnessNotifier,
+                    builder: (_, roughness, __) => Row(
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: roughness > 1.5 ? UberColors.red : UberColors.green,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          roughness.toStringAsFixed(1),
+                          style: UberTypography.display.copyWith(
+                            fontSize: 22,
+                            color: roughness > 1.5 ? UberColors.red : UberColors.textPrimary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSpatialHudCard() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+      decoration: BoxDecoration(
+        color: UberColors.surface.withValues(alpha: 0.95),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: UberColors.border),
+      ),
+      child: Row(
+        children: [
+          // Burst Timer
+          Expanded(
+            flex: 3,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("RECORDING TIME", style: UberTypography.caption.copyWith(fontSize: 10)),
+                const SizedBox(height: 2),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.baseline,
+                  textBaseline: TextBaseline.alphabetic,
+                  children: [
+                    Text(
+                      "00:${_spatialRecordingSeconds.toString().padLeft(2, '0')}",
+                      style: UberTypography.display.copyWith(
+                        fontSize: 30,
+                        color: _isRecordingSpatialVideo ? UberColors.red : UberColors.white,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    const Text(
+                      "/ 01:30",
+                      style: TextStyle(
+                        color: UberColors.textTertiary,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          Container(width: 1, height: 36, color: UberColors.border),
+
+          // Security-Bound Locked GPS Points
+          Expanded(
+            flex: 4,
+            child: Padding(
+              padding: const EdgeInsets.only(left: 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("ANTI-SPOOF GPS LOCK", style: UberTypography.caption.copyWith(fontSize: 10)),
+                  const SizedBox(height: 2),
+                  ValueListenableBuilder<int>(
+                    valueListenable: _spatialSecurityService.pointCountNotifier,
+                    builder: (_, count, __) => ValueListenableBuilder<double>(
+                      valueListenable: _spatialSecurityService.latestAccuracyNotifier,
+                      builder: (_, acc, __) => Row(
+                        children: [
+                          Container(
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: _isRecordingSpatialVideo
+                                  ? (acc <= 20 ? UberColors.green : UberColors.amber)
+                                  : UberColors.textTertiary,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Text(
+                            "$count PTS",
+                            style: UberTypography.display.copyWith(
+                              fontSize: 22,
+                              color: _isRecordingSpatialVideo ? UberColors.white : UberColors.textSecondary,
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: UberColors.surfaceElevated,
+                              borderRadius: BorderRadius.circular(4),
+                              border: Border.all(color: UberColors.border),
+                            ),
+                            child: Text(
+                              acc > 0 ? "±${acc.toStringAsFixed(0)}m" : "LOCKING",
+                              style: const TextStyle(
+                                color: UberColors.textSecondary,
+                                fontSize: 10,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPatrolBottomInfo() {
+    return Row(
+      children: [
+        // GPS Coords
+        Expanded(
+          child: ValueListenableBuilder(
+            valueListenable: _sensorService.positionNotifier,
+            builder: (_, pos, __) => Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("GPS COORDINATES", style: UberTypography.caption.copyWith(fontSize: 10)),
+                const SizedBox(height: 3),
+                Text(
+                  pos == null
+                      ? "Acquiring..."
+                      : "${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)}",
+                  style: const TextStyle(color: UberColors.textPrimary, fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        // Node Info
+        Expanded(
+          child: InkWell(
+            onTap: _showUrlDialog,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("TARGET NODE", style: UberTypography.caption.copyWith(fontSize: 10)),
+                const SizedBox(height: 3),
+                Text(
+                  _targetUrl == "Not Set" ? "Tap to configure" : UrlHelper.toDisplayString(_targetUrl),
+                  style: const TextStyle(
+                    color: UberColors.blue,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    decoration: TextDecoration.underline,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSpatialBottomInfo() {
+    return Row(
+      children: [
+        // Live GPS Fix
+        Expanded(
+          child: ValueListenableBuilder(
+            valueListenable: _sensorService.positionNotifier,
+            builder: (_, pos, __) => Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("SPATIAL GPS TRAIL", style: UberTypography.caption.copyWith(fontSize: 10)),
+                const SizedBox(height: 3),
+                Text(
+                  pos == null
+                      ? "Acquiring Fix..."
+                      : "${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)}",
+                  style: const TextStyle(color: UberColors.textPrimary, fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        // Local Queue & Storage Metric
+        Expanded(
+          child: ValueListenableBuilder<List<SpatialVideoReport>>(
+            valueListenable: _spatialQueueService.reportsNotifier,
+            builder: (_, reports, __) => InkWell(
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const AccountScreen()),
+                );
+              },
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text("LOCAL STORAGE QUEUE", style: UberTypography.caption.copyWith(fontSize: 10)),
+                  const SizedBox(height: 3),
+                  Row(
+                    children: [
+                      Text(
+                        "${reports.length} videos • ${_spatialQueueService.formattedTotalStorage}",
+                        style: const TextStyle(
+                          color: UberColors.white,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      const SizedBox(width: 4),
+                      const Icon(Icons.arrow_forward_ios, size: 10, color: UberColors.textTertiary),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 

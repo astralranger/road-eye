@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../models/telemetry_payload.dart';
 import '../utils/url_helper.dart';
+import 'resilient_http_client.dart';
 
 class DetectionApiResponse {
   final bool success;
@@ -21,7 +22,9 @@ class DetectionApiResponse {
 }
 
 class ApiService {
-  final http.Client _client = http.Client();
+  final http.Client _client;
+
+  ApiService({http.Client? client}) : _client = client ?? ResilientHttpClient.createClient();
 
   Future<DetectionApiResponse> sendDetectionPayload({
     required String targetUrl,

@@ -23,10 +23,16 @@ class SensorService {
     stop();
 
     // 1. Accelerometer Stream for Vibration Analysis
+    int lastNotifyMs = 0;
     _accelSub = userAccelerometerEventStream().listen((event) {
       _ringBuffer.add(event.z);
-      final roughness = _ringBuffer.calculateRoughness();
-      roughnessNotifier.value = roughness;
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      // Throttle UI update to ~5Hz (200ms) to prevent main thread jank while retaining 100Hz hardware sampling
+      if (nowMs - lastNotifyMs >= 200) {
+        lastNotifyMs = nowMs;
+        final roughness = _ringBuffer.calculateRoughness();
+        roughnessNotifier.value = roughness;
+      }
     });
 
     // 2. High-Accuracy GPS Stream

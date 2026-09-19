@@ -288,40 +288,51 @@ class _MapScreenState extends State<MapScreen> {
       final point = LatLng(primary.latitude, primary.longitude);
       final count = group.length;
 
+      final double markerWidth = count > 9 ? 52 : (count > 1 ? 46 : 30);
+      const double markerHeight = 30;
+
       newMarkers.add(
         Marker(
           point: point,
-          width: count > 1 ? 38 : 28,
-          height: 28,
+          width: markerWidth,
+          height: markerHeight,
           child: GestureDetector(
             onTap: () => _showPotholeBottomSheet(primary, group: group),
             child: Container(
               padding: count > 1 ? const EdgeInsets.symmetric(horizontal: 4) : EdgeInsets.zero,
               decoration: BoxDecoration(
                 color: _getSeverityColor(primary.severity),
-                borderRadius: BorderRadius.circular(14),
+                borderRadius: BorderRadius.circular(15),
                 border: Border.all(color: UberColors.white, width: 2),
                 boxShadow: const [
-                  BoxShadow(color: Colors.black87, blurRadius: 4, offset: Offset(0, 2))
+                  BoxShadow(color: Colors.black87, blurRadius: 4, offset: Offset(0, 2)),
                 ],
               ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Icon(Icons.warning_amber_rounded, color: UberColors.black, size: 14),
-                  if (count > 1) ...[
-                    const SizedBox(width: 2),
-                    Text(
-                      count > 99 ? '99+' : '$count',
-                      style: const TextStyle(
-                        color: UberColors.black,
-                        fontSize: 10,
-                        fontWeight: FontWeight.w900,
-                      ),
+              child: Center(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 2),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        const Icon(Icons.warning_amber_rounded, color: UberColors.black, size: 14),
+                        if (count > 1) ...[
+                          const SizedBox(width: 2),
+                          Text(
+                            count > 99 ? '99+' : '$count',
+                            style: const TextStyle(
+                              color: UberColors.black,
+                              fontSize: 10,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
-                  ],
-                ],
+                  ),
+                ),
               ),
             ),
           ),

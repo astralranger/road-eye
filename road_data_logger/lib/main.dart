@@ -5,6 +5,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'config/app_config.dart';
 import 'screens/auth_screen.dart';
 import 'screens/data_collector_view.dart';
+import 'services/spatial_queue_service.dart';
 import 'theme/uber_theme.dart';
 
 void main() async {
@@ -12,6 +13,7 @@ void main() async {
   await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
 
   await AppConfig.initialize();
+  await SpatialQueueService().initialize();
 
   runApp(const MyApp());
 }

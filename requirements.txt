@@ -25,7 +25,10 @@ python-multipart>=0.0.9
 # --- Cloud Database, Storage & Networking ---
 supabase>=2.3.0
 httpx>=0.25.0
+requests>=2.31.0
+PyJWT>=2.8.0
 python-dotenv>=1.0.0
 
 # --- Asynchronous Services & Alerting ---
 aiosmtplib>=3.0.0
+

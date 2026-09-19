@@ -19,6 +19,8 @@ dependencies:
   permission_handler: ^11.3.0
   shared_preferences: ^2.2.2
   flutter_dotenv: ^5.1.0  # <--- This was missing/unresolved
+  path_provider: ^2.1.2
+  crypto: ^3.0.3
 
   # Backend & Maps
   supabase_flutter: ^2.3.0
