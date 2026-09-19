@@ -1,0 +1,48 @@
+{
+  "video": "0002",
+  "telemetry": {
+    "max_depth_cm": 12.5,
+    "volume_liters": 83.31,
+    "surface_area_cm2": 13006.6,
+    "num_cavities": 2,
+    "severity": "Severe",
+    "total_splats": 156266,
+    "fps": 0.6,
+    "focus_target": [
+      0.3230648934841156,
+      -0.05587213113903999,
+      0.024488462135195732
+    ],
+    "ply_filename": "0002_3dgs.ply"
+  },
+  "cavities": [
+    {
+      "box": [
+        537,
+        487,
+        873,
+        800
+      ],
+      "max_depth_cm": 12.5,
+      "mean_depth_cm": 7.5,
+      "volume_liters": 65.71,
+      "surface_area_cm2": 10423.4,
+      "severity": "Severe"
+    },
+    {
+      "box": [
+        409,
+        733,
+        575,
+        947
+      ],
+      "max_depth_cm": 12.5,
+      "mean_depth_cm": 7.5,
+      "volume_liters": 17.6,
+      "surface_area_cm2": 2583.2,
+      "severity": "Severe"
+    }
+  ],
+  "output_ply": "C:\\The Sketchbook\\SEM VII\\AutonomousCam\\Tethered\\reconstruction_outputs\\0002_3dgs.ply",
+  "output_viewer": "C:\\The Sketchbook\\SEM VII\\AutonomousCam\\Tethered\\reconstruction_outputs\\0002_3d_viewer.html"
+}

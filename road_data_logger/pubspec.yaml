@@ -33,6 +33,6 @@ dev_dependencies:
 flutter:
   uses-material-design: true
 
-  # IMPORTANT: This allows the app to read the .env file
+  # Asset bundle paths
   assets:
-    - .env
+    - assets/
