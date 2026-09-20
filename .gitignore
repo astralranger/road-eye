@@ -1,0 +1,79 @@
+# =====================================================================
+# RoadEye - Production Git Ignore
+# =====================================================================
+
+# --- Environment & Secret Configuration ---
+.env
+*.env
+*.env.*
+!.env.example
+*.env copy
+
+# --- Machine Learning Checkpoints & Model Weights (>100MB) ---
+*.pth
+*.pt
+*.onnx
+*.tflite
+*.pb
+*.bin
+*.safetensors
+best_saved_model/
+checkpoints/
+models/
+
+# --- Video Datasets & Media Archives ---
+Datasets/
+datasets/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.tar
+*.tar.gz
+*.zip
+
+# --- Binary Executables & CLI Tools ---
+*.exe
+cloudflared.exe
+
+# --- Reconstruction & Pipeline Outputs ---
+outputs/
+demo_outputs/
+reconstruction_outputs/
+storage/
+*.ply
+
+# --- Python Environments & Caches ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# --- Flutter / Dart Build & Dependency Artifacts ---
+road_data_logger/.dart_tool/
+road_data_logger/.flutter-plugins
+road_data_logger/.flutter-plugins-dependencies
+road_data_logger/.packages
+road_data_logger/build/
+road_data_logger/android/.gradle/
+road_data_logger/android/app/build/
+road_data_logger/ios/Pods/
+road_data_logger/ios/.symlinks/
+road_data_logger/windows/flutter/ephemeral/
+road_data_logger/linux/flutter/ephemeral/
+road_data_logger/macos/Flutter/ephemeral/
+
+# --- IDEs & OS Files ---
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
