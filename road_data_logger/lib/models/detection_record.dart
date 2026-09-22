@@ -31,6 +31,18 @@ class DetectionRecord {
     );
   }
 
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'latitude': latitude,
+      'longitude': longitude,
+      'image_url': imageUrl,
+      'created_at': createdAt,
+      'severity': severity,
+      'user_id': userId,
+    };
+  }
+
   Color get markerColor {
     switch (severity.toLowerCase()) {
       case 'severe':

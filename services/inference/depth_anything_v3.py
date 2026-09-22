@@ -599,7 +599,7 @@ def render_fixed_3d_road(video_path="/content/0001.mp4", frame_idx=0, downsample
 
             const camera = new THREE.PerspectiveCamera(55, container.clientWidth / container.clientHeight, 0.1, 100);
 
-            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            const renderer = new THREE.WebGLRenderer({{ antialias: true, powerPreference: "default", failIfMajorPerformanceCaveat: false }});
             renderer.setSize(container.clientWidth, container.clientHeight);
             renderer.setPixelRatio(window.devicePixelRatio);
             container.appendChild(renderer.domElement);
@@ -762,7 +762,7 @@ def render_segmented_pothole_3d(
 
             const camera = new THREE.PerspectiveCamera(55, container.clientWidth / container.clientHeight, 0.1, 100);
 
-            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            const renderer = new THREE.WebGLRenderer({{ antialias: true, powerPreference: "default", failIfMajorPerformanceCaveat: false }});
             renderer.setSize(container.clientWidth, container.clientHeight);
             renderer.setPixelRatio(window.devicePixelRatio);
             container.appendChild(renderer.domElement);
@@ -925,7 +925,7 @@ def render_segmented_pothole_3d(
 
             const camera = new THREE.PerspectiveCamera(55, container.clientWidth / container.clientHeight, 0.1, 100);
 
-            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            const renderer = new THREE.WebGLRenderer({{ antialias: true, powerPreference: "default", failIfMajorPerformanceCaveat: false }});
             renderer.setSize(container.clientWidth, container.clientHeight);
             renderer.setPixelRatio(window.devicePixelRatio);
             container.appendChild(renderer.domElement);
@@ -1110,7 +1110,7 @@ def render_adaptive_pothole_3d(
 
             const camera = new THREE.PerspectiveCamera(55, container.clientWidth / container.clientHeight, 0.1, 100);
 
-            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            const renderer = new THREE.WebGLRenderer({{ antialias: true, powerPreference: "default", failIfMajorPerformanceCaveat: false }});
             renderer.setSize(container.clientWidth, container.clientHeight);
             renderer.setPixelRatio(window.devicePixelRatio);
             container.appendChild(renderer.domElement);
@@ -1292,7 +1292,7 @@ def render_adaptive_pothole_3d(
 
             const camera = new THREE.PerspectiveCamera(55, container.clientWidth / container.clientHeight, 0.1, 100);
 
-            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            const renderer = new THREE.WebGLRenderer({{ antialias: true, powerPreference: "default", failIfMajorPerformanceCaveat: false }});
             renderer.setSize(container.clientWidth, container.clientHeight);
             renderer.setPixelRatio(window.devicePixelRatio);
             container.appendChild(renderer.domElement);

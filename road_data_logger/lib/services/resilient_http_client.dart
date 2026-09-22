@@ -55,6 +55,11 @@ class ResilientHttpClient {
     resolvedIp ??= await resolveHostViaDoH(targetHost);
 
     if (resolvedIp == null) {
+      if (targetHost.contains('.ts.net')) {
+        throw SocketException(
+          'Failed host lookup for $targetHost. If Tailscale Funnel was recently started, public DNS takes 1-3 minutes to propagate. (Tip: If phone and laptop share the same Wi-Fi, tap "Local Wi-Fi" preset).',
+        );
+      }
       throw SocketException('Failed host lookup for $targetHost (System DNS and DoH failed)');
     }
 
@@ -83,6 +88,8 @@ class ResilientHttpClient {
     }
 
     final dohEndpoints = [
+      'https://8.8.8.8/resolve?name=$host&type=A',
+      'https://1.1.1.1/dns-query?name=$host&type=A',
       'https://dns.google/resolve?name=$host&type=A',
       'https://cloudflare-dns.com/dns-query?name=$host&type=A',
     ];

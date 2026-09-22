@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../config/app_config.dart';
 import '../models/spatial_video_report.dart';
 import '../services/spatial_queue_service.dart';
@@ -16,7 +16,6 @@ class AccountScreen extends StatefulWidget {
 
 class _AccountScreenState extends State<AccountScreen> {
   final SpatialQueueService _queueService = SpatialQueueService();
-  RealtimeChannel? _realtimeSubscription;
   Map<String, dynamic>? _resolvedNode;
   bool _isTestingNode = false;
   Map<String, dynamic>? _nodeHealthResult;
@@ -24,86 +23,53 @@ class _AccountScreenState extends State<AccountScreen> {
   @override
   void initState() {
     super.initState();
-    _setupRealtimeSubscription();
     _loadResolvedNode();
+    _queueService.refreshRemoteStatuses();
+  }
+
+  Future<void> _launchViewerUrl(String rawUrl) async {
+    try {
+      String targetUrl = rawUrl.trim();
+      // If the URL is localhost or 127.0.0.1, adapt it to the active compute node or public host
+      if (targetUrl.contains("localhost") || targetUrl.contains("127.0.0.1")) {
+        final activeUrl = _resolvedNode?['funnel_url']?.toString();
+        if (activeUrl != null && activeUrl.isNotEmpty && !activeUrl.contains("localhost") && !activeUrl.contains("127.0.0.1")) {
+          final uri = Uri.tryParse(targetUrl);
+          if (uri != null) {
+            targetUrl = "$activeUrl${uri.path}";
+          }
+        }
+      }
+
+      final uri = Uri.parse(targetUrl);
+      final launched = await launchUrl(
+        uri,
+        mode: LaunchMode.inAppBrowserView,
+        browserConfiguration: const BrowserConfiguration(showTitle: true),
+      );
+      if (!launched) {
+        await launchUrl(uri, mode: LaunchMode.inAppWebView);
+      }
+      if (!launched) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      }
+    } catch (e) {
+      debugPrint("Error launching viewer URL: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Could not open 3D viewer: $e"),
+            backgroundColor: UberColors.red,
+          ),
+        );
+      }
+    }
   }
 
   Future<void> _loadResolvedNode() async {
     final node = await TailscaleFunnelUploadHandler.resolveComputeNode();
     if (mounted) {
       setState(() => _resolvedNode = node);
-    }
-  }
-
-  @override
-  void dispose() {
-    _realtimeSubscription?.unsubscribe();
-    super.dispose();
-  }
-
-  void _setupRealtimeSubscription() {
-    if (!AppConfig.isSupabaseInitialized) return;
-    final userId = AppConfig.currentUser?.id;
-    if (userId == null) return;
-
-    try {
-      _realtimeSubscription = AppConfig.supabase
-          .channel('spatial_reports_live_$userId')
-          .onPostgresChanges(
-            event: PostgresChangeEvent.update,
-            schema: 'public',
-            table: 'spatial_video_reports',
-            filter: PostgresChangeFilter(
-              type: PostgresChangeFilterType.eq,
-              column: 'user_id',
-              value: userId,
-            ),
-            callback: (payload) {
-              final newRecord = payload.newRecord;
-              final id = newRecord['id']?.toString();
-              final splatStatus = newRecord['splat_status']?.toString() ?? 'queued';
-              final progressPct = (newRecord['progress_pct'] as num?)?.toInt() ?? 0;
-              final nodeId = newRecord['processing_node_id']?.toString();
-
-              if (id != null) {
-                _queueService.updateReportProgress(
-                  id: id,
-                  splatStatus: splatStatus,
-                  progressPct: progressPct,
-                  processingNodeId: nodeId,
-                );
-                if (mounted) setState(() {});
-              }
-            },
-          )
-          .onPostgresChanges(
-            event: PostgresChangeEvent.insert,
-            schema: 'public',
-            table: 'spatial_reconstructions',
-            filter: PostgresChangeFilter(
-              type: PostgresChangeFilterType.eq,
-              column: 'user_id',
-              value: userId,
-            ),
-            callback: (payload) {
-              final record = payload.newRecord;
-              final reportId = record['report_id']?.toString();
-              if (reportId != null) {
-                _queueService.updateReportProgress(
-                  id: reportId,
-                  splatStatus: 'completed',
-                  progressPct: 100,
-                  cavityVolumeLiters: (record['total_cavity_volume_liters'] as num?)?.toDouble(),
-                  maxDepthCm: (record['max_depth_cm'] as num?)?.toDouble(),
-                  viewerHtmlPath: record['viewer_html_path']?.toString(),
-                );
-                if (mounted) setState(() {});
-              }
-            },
-          )
-          .subscribe();
-    } catch (e) {
-      debugPrint("Realtime subscription setup warning: $e");
     }
   }
 
@@ -692,6 +658,45 @@ class _AccountScreenState extends State<AccountScreen> {
                       ),
                     ],
                   ),
+                  if (report.meanDepthCm != null) ...[
+                    const Divider(color: UberColors.border, height: 20),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text("Mean Depth:", style: TextStyle(color: UberColors.textSecondary, fontSize: 13)),
+                        Text(
+                          "${report.meanDepthCm!.toStringAsFixed(1)} cm",
+                          style: const TextStyle(color: UberColors.white, fontSize: 14, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                  ],
+                  if (report.surfaceAreaSqm != null) ...[
+                    const Divider(color: UberColors.border, height: 20),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text("Surface Area:", style: TextStyle(color: UberColors.textSecondary, fontSize: 13)),
+                        Text(
+                          "${(report.surfaceAreaSqm! * 10000).toStringAsFixed(0)} cm²",
+                          style: const TextStyle(color: UberColors.white, fontSize: 14, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                  ],
+                  if (report.voxelCount != null) ...[
+                    const Divider(color: UberColors.border, height: 20),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text("Point / Voxel Count:", style: TextStyle(color: UberColors.textSecondary, fontSize: 13)),
+                        Text(
+                          "${report.voxelCount} pts",
+                          style: const TextStyle(color: UberColors.white, fontSize: 14, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                  ],
                   const Divider(color: UberColors.border, height: 20),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -708,22 +713,18 @@ class _AccountScreenState extends State<AccountScreen> {
             ),
             const SizedBox(height: 16),
             if (report.viewerHtmlPath != null && report.viewerHtmlPath!.isNotEmpty) ...[
-              Text(
-                "3D WebGL Viewer Endpoint (Tailscale Funnel):",
-                style: UberTypography.caption.copyWith(fontSize: 10),
-              ),
-              const SizedBox(height: 4),
-              Container(
+              SizedBox(
                 width: double.infinity,
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: UberColors.surfaceElevated,
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(color: UberColors.border),
-                ),
-                child: SelectableText(
-                  report.viewerHtmlPath!,
-                  style: const TextStyle(color: UberColors.blue, fontSize: 12, fontFamily: 'monospace'),
+                height: 48,
+                child: ElevatedButton.icon(
+                  icon: const Icon(Icons.view_in_ar_rounded, size: 20),
+                  label: const Text("LAUNCH 3D WEBGL VIEWER", style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 0.5)),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: UberColors.green,
+                    foregroundColor: UberColors.black,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                  onPressed: () => _launchViewerUrl(report.viewerHtmlPath!),
                 ),
               ),
               const SizedBox(height: 16),
@@ -785,9 +786,16 @@ class _AccountScreenState extends State<AccountScreen> {
         ),
       ),
       body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
+        child: RefreshIndicator(
+          color: UberColors.white,
+          backgroundColor: UberColors.surfaceElevated,
+          onRefresh: () async {
+            await _queueService.refreshRemoteStatuses();
+          },
+          child: ListView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(16),
+            children: [
             // 1. User Profile Card
             Container(
               padding: const EdgeInsets.all(16),
@@ -1086,8 +1094,9 @@ class _AccountScreenState extends State<AccountScreen> {
           ],
         ),
       ),
-    );
-  }
+    ),
+  );
+}
 
   Widget _buildMetricTile({
     required String title,

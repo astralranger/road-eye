@@ -18,14 +18,52 @@ import uuid
 from dotenv import load_dotenv
 import jwt
 import torch
+import math
+import cv2
+import base64
+import numpy as np
+from PIL import Image
+from scipy.spatial.distance import cosine
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, BackgroundTasks, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-# Add repository root and core/depth_engine package to sys.path
+# --- PYTORCH RESILIENT LOADER INTERCEPTOR (Weights & Pos-Embed Resize) ---
+original_load = torch.load
+def safe_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return original_load(*args, **kwargs)
+torch.load = safe_load
+
+original_load_state_dict = torch.nn.Module.load_state_dict
+def dynamic_resize_load_state_dict(self, state_dict, strict=True, assign=False):
+    my_state = self.state_dict()
+    for k, v in list(state_dict.items()):
+        if k in my_state:
+            target_shape = my_state[k].shape
+            if v.shape != target_shape:
+                if 'position_embeddings' in k and len(v.shape) == 3 and len(target_shape) == 3:
+                    cls_tok, pos_tok = v[:, 0:1, :], v[:, 1:, :]
+                    grid_old = int(math.sqrt(pos_tok.shape[1]))
+                    grid_new = int(math.sqrt(target_shape[1] - 1))
+                    if grid_old**2 == pos_tok.shape[1] and grid_new**2 == (target_shape[1]-1):
+                        pos_tok_2d = pos_tok.reshape(1, grid_old, grid_old, -1).permute(0, 3, 1, 2)
+                        new_pos_tok_2d = torch.nn.functional.interpolate(pos_tok_2d.float(), size=(grid_new, grid_new), mode='bicubic', align_corners=False)
+                        state_dict[k] = torch.cat((cls_tok, new_pos_tok_2d.permute(0, 2, 3, 1).reshape(1, target_shape[1]-1, -1).to(v.dtype)), dim=1)
+                        continue
+                if len(v.shape) == 4 and len(target_shape) == 4 and v.shape[:2] == target_shape[:2]:
+                    state_dict[k] = torch.nn.functional.interpolate(v.float(), size=target_shape[2:], mode='bicubic', align_corners=False).to(v.dtype)
+                    continue
+                del state_dict[k]
+    return original_load_state_dict(self, state_dict, strict=False, assign=assign)
+
+torch.nn.Module.load_state_dict = dynamic_resize_load_state_dict
+
+# Add repository root, core/depth_engine, and services to sys.path
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent.parent
 sys.path.extend([
@@ -33,6 +71,8 @@ sys.path.extend([
     str(REPO_ROOT),
     str(REPO_ROOT / "core" / "depth_engine"),
     str(REPO_ROOT / "core"),
+    str(REPO_ROOT / "services"),
+    str(REPO_ROOT / "services" / "inference"),
     str(REPO_ROOT / "Depth"),
 ])
 
@@ -55,22 +95,37 @@ logging.basicConfig(
 logger = logging.getLogger("FunnelIngress")
 
 # --- ENVIRONMENT & CONFIGURATION ---
-load_dotenv(dotenv_path=REPO_ROOT / ".env")
+# Load Tethered/.env first with override, then REPO_ROOT/.env as fallback
+load_dotenv(dotenv_path=BASE_DIR / ".env", override=True)
+if (REPO_ROOT / ".env").exists():
+    load_dotenv(dotenv_path=REPO_ROOT / ".env", override=False)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://zqecqujwcgzqblhtgmbc.supabase.co")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-TAILSCALE_FUNNEL_URL = os.getenv("TAILSCALE_FUNNEL_URL", "http://localhost:8000")
+TAILSCALE_FUNNEL_URL = os.getenv("TAILSCALE_FUNNEL_URL", "https://starship.tail454ce8.ts.net")
 NODE_ID = os.getenv("NODE_ID", socket.gethostname().lower().replace(" ", "-"))
 NODE_NAME = os.getenv("NODE_NAME", f"Edge GPU Node ({socket.gethostname()})")
-RFDETR_CHECKPOINT = os.getenv("RFDETR_CHECKPOINT", str(REPO_ROOT / "best_saved_model" / "checkpoint_best_ema.pth"))
+RFDETR_CHECKPOINT = os.getenv("RFDETR_CHECKPOINT", "")
+if not RFDETR_CHECKPOINT or not Path(RFDETR_CHECKPOINT).exists():
+    possible_ckpts = [
+        BASE_DIR / "best_saved_model" / "checkpoint_best_ema.pth",
+        REPO_ROOT / "best_saved_model" / "checkpoint_best_ema.pth",
+        Path(r"C:\The Sketchbook\SEM VI\PBL\Tethered\best_saved_model\checkpoint_best_ema.pth"),
+    ]
+    for p in possible_ckpts:
+        if p.exists():
+            RFDETR_CHECKPOINT = str(p)
+            break
 
 STORAGE_DIR = Path(os.getenv("STORAGE_DIR", str(REPO_ROOT / "storage")))
 UPLOAD_DIR = STORAGE_DIR / "videos"
 TELEMETRY_DIR = STORAGE_DIR / "telemetry"
 OUTPUT_DIR = STORAGE_DIR / "reconstructions"
+STATIC_DIR = (REPO_ROOT / "services" / "dashboard" / "static") if (REPO_ROOT / "services" / "dashboard" / "static").exists() else (BASE_DIR / "static")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 TELEMETRY_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 # Supabase Admin Client
 supabase_admin: Optional[Client] = None
@@ -98,6 +153,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 def is_valid_uuid(val: Any) -> bool:
@@ -154,7 +211,7 @@ async def verify_supabase_jwt(authorization: Optional[str] = Header(None)) -> Di
 # --- BACKGROUND HEARTBEAT DAEMON ---
 async def heartbeat_daemon():
     """
-    Periodically updates the 'system_health' table in Supabase every 30 seconds
+    Periodically updates the 'system_health' table in Supabase every 15 seconds
     to advertise node availability, GPU VRAM status, and public Funnel URL.
     """
     global active_jobs_count
@@ -189,11 +246,13 @@ async def heartbeat_daemon():
                 }
 
                 supabase_admin.from_("system_health").upsert(payload).execute()
-                logger.debug(f"Heartbeat published for node {NODE_ID} ({node_status})")
+                logger.info(f"Heartbeat updated for node '{NODE_ID}' ({node_status}) at {payload['last_heartbeat']}")
+            else:
+                logger.warning("Heartbeat skipped: supabase_admin is not initialized! Check SUPABASE_SERVICE_ROLE_KEY in .env")
         except Exception as e:
             logger.warning(f"Heartbeat publication failed: {e}")
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(15)
 
 
 @app.on_event("startup")
@@ -252,14 +311,23 @@ def run_heavy_pipeline_sync(
             rfdetr_checkpoint=RFDETR_CHECKPOINT if os.path.exists(RFDETR_CHECKPOINT) else None
         )
 
-        # Update progress (35%)
-        if supabase_admin and is_valid_uuid(report_id):
-            supabase_admin.from_("spatial_video_reports").update({
-                "progress_pct": 35
-            }).eq("id", report_id).execute()
+        def on_pipeline_progress(pct: int, stage_desc: str):
+            logger.info(f"[{report_id}] Pipeline Progress: {pct}% - {stage_desc}")
+            if supabase_admin and is_valid_uuid(report_id):
+                try:
+                    supabase_admin.from_("spatial_video_reports").update({
+                        "progress_pct": pct,
+                        "splat_status": "processing",
+                        "error_message": stage_desc
+                    }).eq("id", report_id).execute()
+                except Exception as pe:
+                    logger.warning(f"[{report_id}] Progress update failed: {pe}")
 
-        # Step 3: Run full video scan, metric depth inversion, 3DGS PLY & Three.js WebGL viewer
-        results = pipeline.process_video(video_path=video_path)
+        # Step 3: Run full video scan, metric depth inversion, 3DGS PLY & Three.js WebGL viewer with live progress callbacks
+        results = pipeline.process_video(
+            video_path=video_path,
+            progress_callback=on_pipeline_progress
+        )
 
         telemetry = results.get("telemetry", {})
         max_depth_cm = float(telemetry.get("max_depth_cm", 0.0))
@@ -277,7 +345,8 @@ def run_heavy_pipeline_sync(
 
         # Output file paths
         ply_path = results.get("ply_path", "")
-        html_path = results.get("viewer_html_path", "")
+        html_path = results.get("html_path") or results.get("viewer_html_path", "")
+        inspection_img_path = results.get("inspection_image_path", "")
 
         # Public viewer URL via Tailscale Funnel
         viewer_url = f"{TAILSCALE_FUNNEL_URL}/api/v1/spatial/reconstruction/{report_id}/viewer"
@@ -302,10 +371,17 @@ def run_heavy_pipeline_sync(
                         "severity": telemetry.get("severity", "Moderate"),
                         "max_depth_cm": max_depth_cm,
                         "volume_liters": volume_liters,
-                        "splats": total_splats
+                        "splats": total_splats,
+                        "inspection_image": inspection_img_path
                     }
                 ]
             }
+
+            # Delete any prior reconstruction row for idempotency / re-runs
+            try:
+                supabase_admin.from_("spatial_reconstructions").delete().eq("report_id", report_id).execute()
+            except Exception as del_err:
+                logger.warning(f"[{report_id}] Old reconstruction cleanup note: {del_err}")
 
             supabase_admin.from_("spatial_reconstructions").insert(reconstruction_payload).execute()
 
@@ -332,6 +408,7 @@ def run_heavy_pipeline_sync(
 # --- HTTP ENDPOINTS ---
 
 @app.get("/health")
+@app.get("/api/v1/spatial/health")
 async def health_check():
     """Returns local node health, GPU capacity, and active workload."""
     gpu_available = torch.cuda.is_available()
@@ -413,6 +490,19 @@ async def upload_spatial_video(
 
     file_size_bytes = os.path.getsize(dest_file_path)
     logger.info(f"Stored {file_size_bytes} bytes at {dest_file_path}")
+
+    # Immediately update Supabase so backend and client register the data drop
+    if supabase_admin and is_valid_uuid(report_id):
+        try:
+            supabase_admin.from_("spatial_video_reports").update({
+                "storage_status": "offloaded_to_node",
+                "splat_status": "processing",
+                "progress_pct": 15,
+                "processing_node_id": NODE_ID,
+                "error_message": "Video received by node. Initializing 3DGS pipeline."
+            }).eq("id", report_id).execute()
+        except Exception as e:
+            logger.warning(f"Failed to record data drop in Supabase: {e}")
 
     # Container verification: inspect MP4 top-level atoms (ftyp, moov)
     has_ftyp, has_moov = False, False
@@ -508,7 +598,6 @@ async def serve_3d_viewer(report_id: str):
     Serves the generated Three.js WebGL 3D reconstruction viewer directly
     via the Tailscale Funnel HTTPS endpoint.
     """
-    # Look for corresponding html file in primary OUTPUT_DIR or legacy dir
     expected_html = OUTPUT_DIR / f"{report_id}_3d_viewer.html"
     if not expected_html.exists():
         legacy_dir = BASE_DIR / "reconstruction_outputs"
@@ -516,13 +605,27 @@ async def serve_3d_viewer(report_id: str):
         if matching:
             expected_html = matching[0]
         else:
-            all_viewers = sorted(list(OUTPUT_DIR.glob("*.html")) + list(legacy_dir.glob("*.html")), key=os.path.getmtime, reverse=True)
-            if all_viewers:
-                expected_html = all_viewers[0]
+            # Fallback to the latest valid RoadEye viewer
+            roadeye_viewers = [
+                f for f in sorted(list(OUTPUT_DIR.glob("*_3d_viewer.html")), key=os.path.getmtime, reverse=True)
+                if "ROADEYE" in f.read_text(encoding="utf-8", errors="ignore")[:800] or "RoadEye" in f.read_text(encoding="utf-8", errors="ignore")[:800]
+            ]
+            if roadeye_viewers:
+                expected_html = roadeye_viewers[0]
             else:
-                raise HTTPException(status_code=404, detail="3D WebGL viewer not yet generated or processing.")
+                all_viewers = sorted(list(OUTPUT_DIR.glob("*.html")) + list(legacy_dir.glob("*.html")), key=os.path.getmtime, reverse=True)
+                if all_viewers:
+                    expected_html = all_viewers[0]
+                else:
+                    raise HTTPException(status_code=404, detail="3D WebGL viewer not yet generated or processing.")
 
-    return HTMLResponse(content=expected_html.read_text(encoding="utf-8"))
+    return HTMLResponse(
+        content=expected_html.read_text(encoding="utf-8"),
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "X-Content-Type-Options": "nosniff"
+        }
+    )
 
 
 @app.get("/api/v1/spatial/reconstruction/{report_id}/ply")
@@ -550,11 +653,272 @@ async def download_splat_ply(report_id: str):
     )
 
 
+@app.get("/api/v1/spatial/reconstruction/{report_id}/inspection")
+async def get_inspection_panel(report_id: str):
+    """
+    Serves the consolidated 7-Panel Multi-Modal Diagnostic Inspection image.
+    """
+    expected_img = OUTPUT_DIR / f"{report_id}_inspection_panel.png"
+    if not expected_img.exists():
+        matching = list(OUTPUT_DIR.glob(f"*{report_id}*.png"))
+        if matching:
+            expected_img = matching[0]
+        else:
+            raise HTTPException(status_code=404, detail="Inspection panel image not found.")
+
+    return FileResponse(
+        path=expected_img,
+        filename=expected_img.name,
+        media_type="image/png"
+    )
+
+
+# =====================================================================
+# --- 2D PATROL MODE REALTIME DETECTION ENDPOINT ---
+# =====================================================================
+
+class DetectionRequest(BaseModel):
+    image: str       
+    gps: dict        
+    instance_ip: Optional[str] = "mobile_client"
+    roughness: Optional[float] = 0.0
+    user_id: Optional[str] = "patrol_user"
+    user_email: Optional[str] = "patrol@roadsense.local"
+
+
+det_2d_model = None
+seg_2d_model = None
+seg_2d_processor = None
+feature_extractor = None
+
+def get_2d_models():
+    global det_2d_model, seg_2d_model, seg_2d_processor, feature_extractor
+    if det_2d_model is None:
+        try:
+            from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+            from rfdetr import RFDETRLarge
+            from feature_extractor import FeatureExtractor
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            try:
+                seg_2d_processor = SegformerImageProcessor.from_pretrained("nvidia/segformer-b0-finetuned-cityscapes-512-1024")
+                seg_2d_model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-cityscapes-512-1024").to(device)
+                seg_2d_model.eval()
+            except Exception as seg_err:
+                logger.warning(f"Segformer semantic model unavailable: {seg_err}")
+
+            if Path(RFDETR_CHECKPOINT).exists():
+                det_2d_model = RFDETRLarge(num_classes=1, pretrain_weights=RFDETR_CHECKPOINT, resolution=640)
+                det_2d_model.optimize_for_inference()
+                logger.info(f"✅ Loaded RF-DETR model from {RFDETR_CHECKPOINT}")
+            else:
+                logger.warning(f"RF-DETR checkpoint not found at {RFDETR_CHECKPOINT}")
+
+            try:
+                feature_extractor = FeatureExtractor()
+            except Exception as feat_err:
+                logger.warning(f"ResNet feature extractor unavailable: {feat_err}")
+
+            logger.info("✅ 2D Pothole Detection Engines Ready.")
+        except Exception as e:
+            logger.error(f"Error initializing 2D detection models: {e}")
+    return det_2d_model, seg_2d_model, seg_2d_processor, feature_extractor
+
+
+@app.post("/detect")
+async def process_patrol_detection(data: DetectionRequest, background_tasks: BackgroundTasks):
+    """
+    Real-time 2D pothole detection endpoint for mobile Patrol Mode.
+    Processes incoming frames with RF-DETR, filters against road mask,
+    uploads evidence to Supabase Storage, and logs to detections table.
+    """
+    try:
+        # A. Telemetry Logging
+        if supabase_admin and data.gps:
+            try:
+                telemetry = {
+                    "latitude": data.gps.get('lat', 0.0),
+                    "longitude": data.gps.get('lon', 0.0),
+                    "roughness": data.roughness,
+                    "session_id": data.instance_ip,
+                    "user_id": data.user_id,
+                    "user_email": data.user_email
+                }
+                background_tasks.add_task(supabase_admin.table("road_logs").insert(telemetry).execute)
+            except Exception as tel_err:
+                logger.debug(f"Telemetry logging warning: {tel_err}")
+
+        # B. Decoding incoming frame
+        img_bytes = base64.b64decode(data.image)
+        cv_img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if cv_img is None:
+            return {"status": "error", "msg": "Invalid image payload"}
+
+        pil_image = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
+        image_area = cv_img.shape[0] * cv_img.shape[1]
+
+        # C. Inference
+        det_m, seg_m, seg_p, feat_ext = get_2d_models()
+        if det_m is None:
+            return {"status": "clear", "msg": "Inference model not initialized"}
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        road_mask = None
+        if seg_m is not None and seg_p is not None:
+            try:
+                inputs = seg_p(images=pil_image, return_tensors="pt").to(device)
+                with torch.no_grad():
+                    outputs = seg_m(**inputs)
+                logits = torch.nn.functional.interpolate(
+                    outputs.logits, size=pil_image.size[::-1], mode="bilinear", align_corners=False
+                )
+                road_mask = (logits.argmax(dim=1).squeeze().cpu().numpy() == 0).astype(np.uint8)
+                road_mask = cv2.dilate(road_mask, np.ones((15, 15), np.uint8), iterations=1)
+            except Exception as r_err:
+                logger.debug(f"Road segmentation warning: {r_err}")
+
+        raw_detections = det_m.predict(pil_image.resize((640, 640)), threshold=0.4)
+        if len(raw_detections) > 0:
+            raw_detections.xyxy[:, [0, 2]] *= (cv_img.shape[1] / 640.0)
+            raw_detections.xyxy[:, [1, 3]] *= (cv_img.shape[0] / 640.0)
+
+        hits = raw_detections
+        if road_mask is not None and len(raw_detections) > 0:
+            keep = []
+            for box in raw_detections.xyxy:
+                x1, y1, x2, y2 = map(int, box)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(road_mask.shape[1], x2), min(road_mask.shape[0], y2)
+                box_area = (x2 - x1) * (y2 - y1)
+                if box_area == 0:
+                    keep.append(False)
+                    continue
+                keep.append((np.sum(road_mask[y1:y2, x1:x2]) / box_area) >= 0.3)
+            hits = raw_detections[np.array(keep)]
+
+        if len(hits) == 0:
+            return {"status": "clear"}
+
+        # D. Annotation & Severity
+        scene = cv_img.copy()
+        new_dets = []
+        for box, conf in zip(hits.xyxy, hits.confidence):
+            x1, y1, x2, y2 = map(int, box)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(cv_img.shape[1], x2), min(cv_img.shape[0], y2)
+            crop = cv_img[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            score = (0.6 * ((x2 - x1) * (y2 - y1) / max(image_area, 1))) + (0.4 * (np.sum(edges > 0) / max(edges.size, 1)))
+
+            if score < 0.3:
+                lab, col = "Minor", (0, 255, 0)
+            elif score < 0.6:
+                lab, col = "Moderate", (0, 255, 255)
+            else:
+                lab, col = "Severe", (0, 0, 255)
+
+            overlay = scene.copy()
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), col, -1)
+            scene = cv2.addWeighted(overlay, 0.35, scene, 0.65, 0)
+            scene[y1:y2, x1:x2][edges > 0] = [255, 255, 255]
+            cv2.rectangle(scene, (x1, y1 - 25), (x2, y1), col, -1)
+            cv2.putText(scene, f"{lab} ({conf:.2f})", (x1 + 5, y1 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+            emb = None
+            if feat_ext is not None:
+                try:
+                    emb = feat_ext.get_embedding(crop)
+                except Exception:
+                    pass
+            new_dets.append({"severity": lab, "embedding": emb})
+
+        # E. Upload Evidence to Supabase Storage
+        _, b = cv2.imencode('.jpg', scene, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        fname = f"ph_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        url = ""
+        if supabase_admin:
+            try:
+                supabase_admin.storage.from_("pothole-images").upload(fname, b.tobytes(), {"content-type": "image/jpeg"})
+                url = supabase_admin.storage.from_("pothole-images").get_public_url(fname)
+            except Exception as up_err:
+                logger.warning(f"Storage upload warning: {up_err}")
+
+        # F. Deduplication & Insert into detections table
+        lat = data.gps.get('lat', 0.0)
+        lon = data.gps.get('lon', 0.0)
+        head = data.gps.get('heading', 0.0)
+
+        if supabase_admin:
+            candidates = None
+            try:
+                candidates = supabase_admin.rpc("find_candidates", {
+                    "search_lat": lat, "search_lon": lon, "radius_m": 8
+                }).execute().data
+            except Exception as cand_err:
+                logger.debug(f"find_candidates RPC fallback: {cand_err}")
+
+            for det in new_dets:
+                match_id = None
+                if candidates and det["embedding"] is not None:
+                    for cand in candidates:
+                        a_diff = abs(cand.get('heading', 0.0) - head)
+                        if a_diff > 180: a_diff = 360 - a_diff
+                        if a_diff > 45: continue
+                        cand_emb = cand.get('embedding')
+                        if cand_emb:
+                            try:
+                                sim = 1 - cosine(det["embedding"], np.array(eval(cand_emb)))
+                                if sim > 0.85:
+                                    match_id = cand['id']
+                                    break
+                            except Exception:
+                                pass
+
+                if match_id:
+                    try:
+                        supabase_admin.table("detections").update({
+                            "report_count": cand.get('report_count', 1) + 1,
+                            "last_seen": datetime.now(timezone.utc).isoformat(),
+                            "image_url": url if url else None
+                        }).eq("id", match_id).execute()
+                    except Exception as upd_err:
+                        logger.warning(f"Detection update warning: {upd_err}")
+                else:
+                    try:
+                        emb_str = str(det["embedding"].tolist()) if (det["embedding"] is not None and hasattr(det["embedding"], "tolist")) else str(det["embedding"])
+                        supabase_admin.table("detections").insert({
+                            "latitude": lat,
+                            "longitude": lon,
+                            "heading": head,
+                            "image_url": url,
+                            "severity": det["severity"],
+                            "user_id": data.user_id,
+                            "user_email": data.user_email,
+                            "embedding": emb_str if emb_str else "[]",
+                            "report_count": 1,
+                            "last_seen": datetime.now(timezone.utc).isoformat()
+                        }).execute()
+                        logger.info(f"🚨 Pothole Logged: {det['severity']} at ({lat:.4f}, {lon:.4f}) by {data.user_email}")
+                    except Exception as ins_err:
+                        logger.error(f"Failed to insert detection into DB: {ins_err}")
+
+        return {"status": "detected", "url": url}
+    except Exception as e:
+        logger.error(f"Error processing /detect request: {e}")
+        return {"status": "error", "detail": str(e)}
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
     logger.info(f"Starting Uvicorn server on port {port}...")
+    app_target = "services.ingress.funnel_ingress:app" if (Path.cwd() == REPO_ROOT) else "funnel_ingress:app"
     uvicorn.run(
-        "funnel_ingress:app",
+        app_target,
         host="0.0.0.0",
         port=port,
         reload=False,

@@ -108,7 +108,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         child: const Icon(Icons.navigation, color: UberColors.black, size: 20),
                       ),
                       const SizedBox(width: 12),
-                      const Text("ROAD SENSE", style: UberTypography.title),
+                      const Text("ROADEYE", style: UberTypography.title),
                     ],
                   ),
                   const SizedBox(height: 32),

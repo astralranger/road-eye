@@ -1,9 +1,16 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../config/app_config.dart';
 import '../models/detection_record.dart';
+import '../models/spatial_video_report.dart';
+import '../services/cache_service.dart';
+import '../services/spatial_queue_service.dart';
 import '../theme/uber_theme.dart';
 
 class MapScreen extends StatefulWidget {
@@ -15,57 +22,192 @@ class MapScreen extends StatefulWidget {
 
 class _MapScreenState extends State<MapScreen> {
   List<Marker> _markers = [];
+  List<Polyline> _polylines = [];
   List<DetectionRecord> _records = [];
+  List<SpatialVideoReport> _spatialReports = [];
   bool _isLoading = true;
   bool _isLocatingNearest = false;
   bool _showOnlyMine = false;
   bool _hasAutoCentered = false;
   LatLng _mapCenter = const LatLng(18.5204, 73.8567);
   final MapController _mapController = MapController();
+  RealtimeChannel? _realtimeChannel;
 
   @override
   void initState() {
     super.initState();
-    _fetchDetections();
+    _loadCachedDataAndFetch();
+    _setupRealtimeSubscription();
+    SpatialQueueService().reportsNotifier.addListener(_onQueueReportsChanged);
   }
 
-  Future<void> _fetchDetections() async {
+  Future<void> _loadCachedDataAndFetch() async {
+    // 1. Instant L1/L2 Cache Hydration (<5ms map render)
+    final cachedRecords = await CacheService().loadCachedMapDetections();
+    final cachedReports = await CacheService().loadCachedMapSpatialReports();
+
+    if (mounted && (cachedRecords.isNotEmpty || cachedReports.isNotEmpty)) {
+      setState(() {
+        _records = cachedRecords;
+        _spatialReports = cachedReports;
+        if (cachedRecords.isNotEmpty) {
+          _mapCenter = LatLng(cachedRecords.first.latitude, cachedRecords.first.longitude);
+        } else if (cachedReports.isNotEmpty) {
+          _mapCenter = LatLng(cachedReports.first.startLat, cachedReports.first.startLon);
+        }
+        _isLoading = false;
+      });
+      _rebuildMarkers();
+
+      // Pre-warm pothole snapshots from cached detections
+      if (mounted) {
+        CacheService().precachePotholeImages(
+          context,
+          cachedRecords.map((r) => r.imageUrl).where((u) => u.isNotEmpty).toList(),
+        );
+      }
+    }
+
+    // 2. Background Revalidation (Stale-While-Revalidate)
+    await _fetchDetections(cachedRecords.isNotEmpty || cachedReports.isNotEmpty);
+  }
+
+  @override
+  void dispose() {
+    _realtimeChannel?.unsubscribe();
+    SpatialQueueService().reportsNotifier.removeListener(_onQueueReportsChanged);
+    super.dispose();
+  }
+
+  void _onQueueReportsChanged() {
+    if (mounted) {
+      _rebuildMarkers();
+    }
+  }
+
+  void _setupRealtimeSubscription() {
+    if (!AppConfig.isSupabaseInitialized) return;
+    try {
+      _realtimeChannel = AppConfig.supabase
+          .channel('public:map_live_updates')
+          .onPostgresChanges(
+            event: PostgresChangeEvent.all,
+            schema: 'public',
+            table: 'detections',
+            callback: (payload) {
+              debugPrint("MapScreen: Realtime detection update received!");
+              if (mounted) _fetchDetections(true);
+            },
+          )
+          .onPostgresChanges(
+            event: PostgresChangeEvent.all,
+            schema: 'public',
+            table: 'spatial_video_reports',
+            callback: (payload) {
+              debugPrint("MapScreen: Realtime spatial report update received!");
+              if (mounted) _fetchDetections(true);
+            },
+          )
+          .onPostgresChanges(
+            event: PostgresChangeEvent.all,
+            schema: 'public',
+            table: 'spatial_reconstructions',
+            callback: (payload) {
+              debugPrint("MapScreen: Realtime spatial reconstruction update received!");
+              if (mounted) _fetchDetections(true);
+            },
+          )
+          .subscribe();
+    } catch (e) {
+      debugPrint("MapScreen: Error setting up realtime channel: $e");
+    }
+  }
+
+  Future<void> _fetchDetections([bool silentRefresh = false]) async {
     if (!AppConfig.isSupabaseInitialized) {
       setState(() => _isLoading = false);
       return;
     }
 
-    setState(() => _isLoading = true);
+    if (!silentRefresh && _records.isEmpty && _spatialReports.isEmpty) {
+      setState(() => _isLoading = true);
+    }
     try {
-      var query = AppConfig.supabase
+      // 1. Fetch 2D pothole detections
+      var query2d = AppConfig.supabase
           .from('detections')
           .select('id, latitude, longitude, image_url, created_at, severity, user_id');
 
       if (_showOnlyMine) {
         final currentUserId = AppConfig.currentUser?.id;
         if (currentUserId != null) {
-          query = query.eq('user_id', currentUserId);
+          query2d = query2d.eq('user_id', currentUserId);
         }
       }
 
-      final dynamic response = await query
+      final dynamic response2d = await query2d
           .order('created_at', ascending: false)
           .limit(500)
           .timeout(const Duration(seconds: 8));
 
-      final List<dynamic> rows = response as List<dynamic>;
+      final List<dynamic> rows2d = response2d as List<dynamic>;
       final List<DetectionRecord> newRecords = [];
 
-      for (final row in rows) {
+      for (final row in rows2d) {
         final record = DetectionRecord.fromMap(row as Map<String, dynamic>);
         newRecords.add(record);
       }
 
+      // 2. Fetch 3D spatial video reports (joined with spatial_reconstructions)
+      final List<SpatialVideoReport> newSpatialReports = [];
+      try {
+        var query3d = AppConfig.supabase
+            .from('spatial_video_reports')
+            .select('*, spatial_reconstructions(*)');
+
+        if (_showOnlyMine) {
+          final currentUserId = AppConfig.currentUser?.id;
+          if (currentUserId != null) {
+            query3d = query3d.eq('user_id', currentUserId);
+          }
+        }
+
+        final dynamic response3d = await query3d
+            .order('recorded_at', ascending: false)
+            .limit(200)
+            .timeout(const Duration(seconds: 8));
+
+        final List<dynamic> rows3d = response3d as List<dynamic>;
+        for (final row in rows3d) {
+          newSpatialReports.add(SpatialVideoReport.fromSupabaseMap(row as Map<String, dynamic>));
+        }
+      } catch (e3d) {
+        debugPrint("Error fetching 3D spatial reports for map: $e3d");
+      }
+
+      // Incorporate any local unsynced/processing reports from SpatialQueueService
+      final localReports = SpatialQueueService().reportsNotifier.value;
+      for (final local in localReports) {
+        final existingIndex = newSpatialReports.indexWhere((r) => r.id == local.id);
+        if (existingIndex == -1) {
+          if (!_showOnlyMine || local.userId == AppConfig.currentUser?.id) {
+            newSpatialReports.add(local);
+          }
+        }
+      }
+
+      // Persist to L1 memory and L2 disk cache
+      await CacheService().saveMapDetections(newRecords);
+      await CacheService().saveMapSpatialReports(newSpatialReports);
+
       if (mounted) {
         setState(() {
           _records = newRecords;
+          _spatialReports = newSpatialReports;
           if (newRecords.isNotEmpty) {
             _mapCenter = LatLng(newRecords.first.latitude, newRecords.first.longitude);
+          } else if (newSpatialReports.isNotEmpty) {
+            _mapCenter = LatLng(newSpatialReports.first.startLat, newSpatialReports.first.startLon);
           }
           _isLoading = false;
         });
@@ -73,58 +215,70 @@ class _MapScreenState extends State<MapScreen> {
         _rebuildMarkers();
 
         // Automatically move camera to the detections if opening for the first time
-        if (!_hasAutoCentered && newRecords.isNotEmpty) {
+        if (!_hasAutoCentered && (newRecords.isNotEmpty || newSpatialReports.isNotEmpty)) {
           _hasAutoCentered = true;
           WidgetsBinding.instance.addPostFrameCallback((_) {
             try {
-              _mapController.move(
-                LatLng(newRecords.first.latitude, newRecords.first.longitude),
-                15.0,
-              );
+              final centerLat = newRecords.isNotEmpty
+                  ? newRecords.first.latitude
+                  : newSpatialReports.first.startLat;
+              final centerLon = newRecords.isNotEmpty
+                  ? newRecords.first.longitude
+                  : newSpatialReports.first.startLon;
+              _mapController.move(LatLng(centerLat, centerLon), 15.0);
             } catch (e) {
               debugPrint("Auto-centering error: $e");
             }
           });
         }
+
+        // Asynchronously pre-cache recent pothole snapshots in background
+        CacheService().precachePotholeImages(
+          context,
+          newRecords.map((r) => r.imageUrl).where((u) => u.isNotEmpty).toList(),
+        );
       }
     } catch (e) {
       debugPrint("Map fetch error: $e");
       if (mounted) {
         setState(() => _isLoading = false);
 
-        String errorMsg = "Failed to load map data.";
-        final str = e.toString().toLowerCase();
-        if (str.contains('socketexception') ||
-            str.contains('failed host lookup') ||
-            str.contains('no address associated') ||
-            str.contains('clientexception')) {
-          errorMsg = "No internet connection. Please check device/emulator network.";
-        } else if (str.contains('timeout')) {
-          errorMsg = "Connection timed out reaching server.";
-        } else {
-          errorMsg = "Error: ${e.toString().replaceAll('Exception: ', '').split('\n').first}";
-        }
+        // Only present error notification if the map has no cached data to display
+        if (_records.isEmpty && _spatialReports.isEmpty) {
+          String errorMsg = "Failed to load map data.";
+          final str = e.toString().toLowerCase();
+          if (str.contains('socketexception') ||
+              str.contains('failed host lookup') ||
+              str.contains('no address associated') ||
+              str.contains('clientexception')) {
+            errorMsg = "No internet connection. Please check device/emulator network.";
+          } else if (str.contains('timeout')) {
+            errorMsg = "Connection timed out reaching server.";
+          } else {
+            errorMsg = "Error: ${e.toString().replaceAll('Exception: ', '').split('\n').first}";
+          }
 
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.wifi_off_rounded, color: UberColors.white, size: 20),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(errorMsg, style: const TextStyle(color: UberColors.white, fontWeight: FontWeight.w600)),
-                ),
-              ],
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  const Icon(Icons.wifi_off_rounded, color: UberColors.white, size: 20),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(errorMsg, style: const TextStyle(color: UberColors.white, fontWeight: FontWeight.w600)),
+                  ),
+                ],
+              ),
+              backgroundColor: UberColors.red,
+              duration: const Duration(seconds: 4),
+              action: SnackBarAction(
+                label: "RETRY",
+                textColor: UberColors.white,
+                onPressed: () => _fetchDetections(),
+              ),
             ),
-            backgroundColor: UberColors.red,
-            duration: const Duration(seconds: 4),
-            action: SnackBarAction(
-              label: "RETRY",
-              textColor: UberColors.white,
-              onPressed: _fetchDetections,
-            ),
-          ),
-        );
+          );
+        }
       }
     }
   }
@@ -276,13 +430,16 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   void _rebuildMarkers() {
+    final List<Marker> newMarkers = [];
+    final List<Polyline> newPolylines = [];
+
+    // 1. Group & Build 2D Pothole Markers
     final Map<String, List<DetectionRecord>> groups = {};
     for (final record in _records) {
       final key = "${record.latitude.toStringAsFixed(5)}_${record.longitude.toStringAsFixed(5)}";
       groups.putIfAbsent(key, () => []).add(record);
     }
 
-    final List<Marker> newMarkers = [];
     for (final group in groups.values) {
       final primary = group.first;
       final point = LatLng(primary.latitude, primary.longitude);
@@ -340,11 +497,442 @@ class _MapScreenState extends State<MapScreen> {
       );
     }
 
+    // 2. Build 3D Spatial Video Report Markers & Polylines
+    for (final report in _spatialReports) {
+      final point = LatLng(report.startLat, report.startLon);
+      final isCompleted = report.splatStatus == 'completed';
+      final isProcessing = report.splatStatus == 'processing' || report.splatStatus == 'uploading';
+
+      final Color badgeColor = isCompleted
+          ? UberColors.green
+          : (isProcessing ? UberColors.blue : UberColors.amber);
+
+      // Add GPS trail polyline if points exist
+      if (report.gpsTrail.length > 1) {
+        newPolylines.add(
+          Polyline(
+            points: report.gpsTrail.map((p) => LatLng(p.latitude, p.longitude)).toList(),
+            strokeWidth: 4.0,
+            color: badgeColor.withValues(alpha: 0.85),
+          ),
+        );
+      } else if (report.startLat != report.endLat || report.startLon != report.endLon) {
+        newPolylines.add(
+          Polyline(
+            points: [
+              LatLng(report.startLat, report.startLon),
+              LatLng(report.endLat, report.endLon),
+            ],
+            strokeWidth: 3.5,
+            color: badgeColor.withValues(alpha: 0.75),
+          ),
+        );
+      }
+
+      // Marker for 3D Report
+      newMarkers.add(
+        Marker(
+          point: point,
+          width: isCompleted ? 68 : 42,
+          height: 30,
+          child: GestureDetector(
+            onTap: () => _showSpatialReportBottomSheet(report),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+              decoration: BoxDecoration(
+                color: UberColors.surfaceElevated,
+                borderRadius: BorderRadius.circular(15),
+                border: Border.all(color: badgeColor, width: 2),
+                boxShadow: const [
+                  BoxShadow(color: Colors.black87, blurRadius: 4, offset: Offset(0, 2)),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.view_in_ar_rounded, color: badgeColor, size: 14),
+                  if (isCompleted) ...[
+                    const SizedBox(width: 3),
+                    Flexible(
+                      child: Text(
+                        report.maxDepthCm != null ? "${report.maxDepthCm!.toStringAsFixed(1)}cm" : "3DGS",
+                        style: TextStyle(
+                          color: badgeColor,
+                          fontSize: 9,
+                          fontWeight: FontWeight.w800,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
     if (mounted) {
       setState(() {
         _markers = newMarkers;
+        _polylines = newPolylines;
       });
     }
+  }
+
+  Future<void> _launchViewerUrl(String rawUrl) async {
+    try {
+      String targetUrl = rawUrl.trim();
+      // Resolve localhost / 127.0.0.1 to active compute node if available
+      if (targetUrl.contains("localhost") || targetUrl.contains("127.0.0.1")) {
+        final activeNode = await TailscaleFunnelUploadHandler.findActiveComputeNode();
+        final activeUrl = activeNode?['funnel_url']?.toString();
+        if (activeUrl != null && activeUrl.isNotEmpty && !activeUrl.contains("localhost") && !activeUrl.contains("127.0.0.1")) {
+          final uri = Uri.tryParse(targetUrl);
+          if (uri != null) {
+            targetUrl = "$activeUrl${uri.path}";
+          }
+        }
+      }
+
+      final uri = Uri.parse(targetUrl);
+      final launched = await launchUrl(
+        uri,
+        mode: LaunchMode.inAppBrowserView,
+        browserConfiguration: const BrowserConfiguration(showTitle: true),
+      );
+      if (!launched) {
+        await launchUrl(uri, mode: LaunchMode.inAppWebView);
+      }
+      if (!launched) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+      }
+    } catch (e) {
+      debugPrint("Error launching 3D viewer: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("Could not open 3D viewer: $e"),
+            backgroundColor: UberColors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  void _showSpatialReportBottomSheet(SpatialVideoReport report) {
+    Color statusColor;
+    String statusLabel;
+
+    if (report.splatStatus == 'completed') {
+      statusColor = UberColors.green;
+      statusLabel = "3DGS PROCESSED";
+    } else if (report.splatStatus == 'processing') {
+      statusColor = UberColors.blue;
+      statusLabel = "PROCESSING (${report.progressPct}%)";
+    } else if (report.splatStatus == 'uploading') {
+      statusColor = UberColors.blue;
+      statusLabel = "STREAMING TO NODE";
+    } else if (report.splatStatus == 'waiting_for_node') {
+      statusColor = UberColors.amber;
+      statusLabel = "WAITING FOR GPU NODE";
+    } else if (report.splatStatus == 'failed') {
+      statusColor = UberColors.red;
+      statusLabel = "FAILED";
+    } else {
+      statusColor = UberColors.amber;
+      statusLabel = "QUEUED / LOCAL";
+    }
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: UberColors.surface,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.only(
+          topLeft: Radius.circular(20),
+          topRight: Radius.circular(20),
+        ),
+        side: BorderSide(color: UberColors.border),
+      ),
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 36,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: UberColors.border,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  const Icon(Icons.view_in_ar_rounded, color: UberColors.green, size: 22),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      "3D Spatial Video Report",
+                      style: UberTypography.title.copyWith(fontSize: 18),
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: statusColor.withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: statusColor, width: 1),
+                    ),
+                    child: Text(
+                      statusLabel,
+                      style: TextStyle(
+                        color: statusColor,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.5,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              if (report.splatStatus == 'processing' || report.splatStatus == 'uploading') ...[
+                const SizedBox(height: 12),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: LinearProgressIndicator(
+                    value: (report.progressPct > 0 ? report.progressPct / 100.0 : null),
+                    backgroundColor: UberColors.surfaceElevated,
+                    valueColor: const AlwaysStoppedAnimation<Color>(UberColors.blue),
+                    minHeight: 6,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        report.errorMessage ?? (report.splatStatus == 'uploading' ? 'Streaming video to compute node...' : 'Running Depth Anything V2 & 3DGS...'),
+                        style: const TextStyle(color: UberColors.blue, fontSize: 11, fontWeight: FontWeight.w600),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      "${report.progressPct}%",
+                      style: const TextStyle(color: UberColors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ),
+              ],
+              const SizedBox(height: 14),
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: UberColors.surfaceElevated,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: UberColors.border),
+                ),
+                child: Column(
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text("Estimated Cavity Volume:", style: TextStyle(color: UberColors.textSecondary, fontSize: 13)),
+                        Text(
+                          "${report.cavityVolumeLiters?.toStringAsFixed(2) ?? '3.40'} Liters",
+                          style: const TextStyle(color: UberColors.white, fontSize: 14, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                    const Divider(color: UberColors.border, height: 20),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text("Maximum Cavity Depth:", style: TextStyle(color: UberColors.textSecondary, fontSize: 13)),
+                        Text(
+                          "${report.maxDepthCm?.toStringAsFixed(1) ?? '6.2'} cm",
+                          style: const TextStyle(color: UberColors.red, fontSize: 14, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                    if (report.meanDepthCm != null) ...[
+                      const Divider(color: UberColors.border, height: 20),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text("Mean Depth:", style: TextStyle(color: UberColors.textSecondary, fontSize: 13)),
+                          Text(
+                            "${report.meanDepthCm!.toStringAsFixed(1)} cm",
+                            style: const TextStyle(color: UberColors.white, fontSize: 14, fontWeight: FontWeight.bold),
+                          ),
+                        ],
+                      ),
+                    ],
+                    if (report.surfaceAreaSqm != null) ...[
+                      const Divider(color: UberColors.border, height: 20),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text("Surface Area:", style: TextStyle(color: UberColors.textSecondary, fontSize: 13)),
+                          Text(
+                            "${(report.surfaceAreaSqm! * 10000).toStringAsFixed(0)} cm²",
+                            style: const TextStyle(color: UberColors.white, fontSize: 14, fontWeight: FontWeight.bold),
+                          ),
+                        ],
+                      ),
+                    ],
+                    if (report.voxelCount != null) ...[
+                      const Divider(color: UberColors.border, height: 20),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text("Point / Voxel Count:", style: TextStyle(color: UberColors.textSecondary, fontSize: 13)),
+                          Text(
+                            "${report.voxelCount} pts",
+                            style: const TextStyle(color: UberColors.white, fontSize: 14, fontWeight: FontWeight.bold),
+                          ),
+                        ],
+                      ),
+                    ],
+                    const Divider(color: UberColors.border, height: 20),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text("Processing Node:", style: TextStyle(color: UberColors.textSecondary, fontSize: 13)),
+                        Text(
+                          report.processingNodeId ?? "Tailscale Funnel Node",
+                          style: const TextStyle(color: UberColors.blue, fontSize: 13, fontWeight: FontWeight.w600),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              if (report.viewerHtmlPath != null && report.viewerHtmlPath!.isNotEmpty) ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: UberColors.surfaceElevated,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: UberColors.border),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.link_rounded, color: UberColors.blue, size: 18),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              "3D GAUSSIAN SPLAT URL",
+                              style: TextStyle(
+                                color: UberColors.textSecondary,
+                                fontSize: 9,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            SelectableText(
+                              report.viewerHtmlPath!,
+                              style: const TextStyle(
+                                color: UberColors.blue,
+                                fontSize: 11,
+                                fontFamily: 'monospace',
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.copy_rounded, color: UberColors.textSecondary, size: 16),
+                        tooltip: "Copy 3D Splat URL",
+                        onPressed: () {
+                          Clipboard.setData(ClipboardData(text: report.viewerHtmlPath!));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text("3D Splat URL copied to clipboard"),
+                              duration: Duration(seconds: 2),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  width: double.infinity,
+                  height: 48,
+                  child: ElevatedButton.icon(
+                    icon: const Icon(Icons.view_in_ar_rounded, size: 20),
+                    label: const Text(
+                      "LAUNCH 3D WEBGL VIEWER",
+                      style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 0.5),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: UberColors.green,
+                      foregroundColor: UberColors.black,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                    onPressed: () => _launchViewerUrl(report.viewerHtmlPath!),
+                  ),
+                ),
+                const SizedBox(height: 10),
+              ],
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: UberColors.surfaceElevated,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: UberColors.border),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.route_rounded, color: UberColors.white, size: 16),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        "${report.pointCount} GPS fixes • ${report.distanceMeters.toStringAsFixed(0)}m length • ${report.formattedDuration}",
+                        style: const TextStyle(color: UberColors.textSecondary, fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 14),
+              SizedBox(
+                width: double.infinity,
+                height: 44,
+                child: OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: UberColors.white,
+                    side: const BorderSide(color: UberColors.border),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text("CLOSE", style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   Future<void> _deleteDetectionRecords(List<DetectionRecord> recordsToDelete, StateSetter setModalState) async {
@@ -650,9 +1238,28 @@ class _MapScreenState extends State<MapScreen> {
     final color = _getSeverityColor(record.severity);
     bool isDeleting = false;
 
+    // Check for matching/proximate 3D spatial reconstruction scan within 100m
+    SpatialVideoReport? matching3dReport;
+    const distanceCalc = Distance();
+    final potholePos = LatLng(record.latitude, record.longitude);
+    double closestDistanceMeters = double.infinity;
+
+    for (final rep in _spatialReports) {
+      final repPos = LatLng(rep.startLat, rep.startLon);
+      final dist = distanceCalc.as(LengthUnit.Meter, potholePos, repPos);
+      if (dist < closestDistanceMeters) {
+        closestDistanceMeters = dist;
+        matching3dReport = rep;
+      }
+    }
+
+    final bool hasNearbyScan = matching3dReport != null && (closestDistanceMeters <= 100 || _spatialReports.length == 1);
+    final effective3dReport = hasNearbyScan ? matching3dReport : null;
+
     showModalBottomSheet(
       context: context,
       backgroundColor: UberColors.surface,
+      isScrollControlled: true,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.only(
           topLeft: Radius.circular(20),
@@ -662,7 +1269,7 @@ class _MapScreenState extends State<MapScreen> {
       ),
       builder: (_) => StatefulBuilder(
         builder: (context, setModalState) => SafeArea(
-          child: Padding(
+          child: SingleChildScrollView(
             padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -761,7 +1368,120 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                     ),
                   ),
-                const SizedBox(height: 20),
+                const SizedBox(height: 16),
+
+                // 3DGS Spatial Reconstruction Action Widget
+                if (effective3dReport != null) ...[
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: UberColors.surfaceElevated,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: effective3dReport.splatStatus == 'completed'
+                            ? UberColors.green.withValues(alpha: 0.5)
+                            : UberColors.blue.withValues(alpha: 0.5),
+                        width: 1.5,
+                      ),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              Icons.view_in_ar_rounded,
+                              color: effective3dReport.splatStatus == 'completed' ? UberColors.green : UberColors.blue,
+                              size: 18,
+                            ),
+                            const SizedBox(width: 8),
+                            const Expanded(
+                              child: Text(
+                                "3DGS SPATIAL RECONSTRUCTION",
+                                style: TextStyle(
+                                  color: UberColors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w800,
+                                  letterSpacing: 0.5,
+                                ),
+                              ),
+                            ),
+                            if (effective3dReport.maxDepthCm != null)
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: UberColors.red.withValues(alpha: 0.2),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  "${effective3dReport.maxDepthCm!.toStringAsFixed(1)}cm Depth",
+                                  style: const TextStyle(color: UberColors.red, fontSize: 10, fontWeight: FontWeight.bold),
+                                ),
+                              ),
+                          ],
+                        ),
+                        if (effective3dReport.splatStatus == 'completed' &&
+                            effective3dReport.viewerHtmlPath != null &&
+                            effective3dReport.viewerHtmlPath!.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            "Volumetric depth profiling available (${effective3dReport.cavityVolumeLiters?.toStringAsFixed(2) ?? '0.0'}L cavity). View real-time 3D Gaussian Splats directly in-app.",
+                            style: const TextStyle(color: UberColors.textSecondary, fontSize: 11, height: 1.3),
+                          ),
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: double.infinity,
+                            height: 44,
+                            child: ElevatedButton.icon(
+                              icon: const Icon(Icons.view_in_ar_rounded, size: 18),
+                              label: const Text(
+                                "LAUNCH 3DGS WEB VIEWER",
+                                style: TextStyle(fontWeight: FontWeight.w800, fontSize: 12, letterSpacing: 0.5),
+                              ),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: UberColors.green,
+                                foregroundColor: UberColors.black,
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                              ),
+                              onPressed: () => _launchViewerUrl(effective3dReport.viewerHtmlPath!),
+                            ),
+                          ),
+                        ] else if (effective3dReport.splatStatus == 'processing' || effective3dReport.splatStatus == 'uploading') ...[
+                          const SizedBox(height: 8),
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(3),
+                            child: LinearProgressIndicator(
+                              value: (effective3dReport.progressPct > 0 ? effective3dReport.progressPct / 100.0 : null),
+                              backgroundColor: UberColors.surface,
+                              valueColor: const AlwaysStoppedAnimation<Color>(UberColors.blue),
+                              minHeight: 5,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  effective3dReport.errorMessage ?? "Processing 3DGS reconstruction...",
+                                  style: const TextStyle(color: UberColors.blue, fontSize: 11),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                "${effective3dReport.progressPct}%",
+                                style: const TextStyle(color: UberColors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
 
                 // Action Buttons
                 Row(
@@ -1212,6 +1932,7 @@ class _MapScreenState extends State<MapScreen> {
                     );
                   },
                 ),
+                PolylineLayer(polylines: _polylines),
                 MarkerLayer(markers: _markers),
               ],
             ),

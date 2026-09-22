@@ -131,6 +131,8 @@ RoadEye converts standard monocular dashcam video into millimeter-accurate metri
 
 ## 🏗️ System Architecture
 
+> 📄 **Formal Engineering Specifications**: For complete architectural derivations, closed-form metric unprojection proofs, and hardware latency budgets, read the [Formal System Architecture Specification](docs/SYSTEM_ARCHITECTURE.md). For edge GPU tunneling setup, see the [Tailscale Funnel Deployment Runbook](docs/TAILSCALE_DEPLOYMENT.md).
+
 ```mermaid
 flowchart TB
     subgraph MobileEdge["📱 Edge Capture Layer (road_data_logger)"]
@@ -258,11 +260,13 @@ road-eye/
 │   │   ├── intelligent_server.py  # FastAPI server with ViT cosine deduplication
 │   │   ├── feature_extractor.py   # Vision Transformer (ViT) patch feature extractor
 │   │   ├── depth_anything_v3.py   # Monocular depth model interface
+│   │   ├── recalculate_all_depths.py # Batch volumetric depth & 3DGS recalculation
+│   │   ├── regenerate_all_viewers.py # Batch Three.js WebGL viewer modernizer
 │   │   └── cleanup.py             # Database maintenance and pruning utility
 │   ├── dashboard/                 # Civic Web Monitoring Dashboard
 │   │   ├── app.py                 # Flask web dashboard application
 │   │   ├── supabase_client.py     # Supabase client wrapper
-│   │   ├── static/                # Styles, map JavaScript, Leaflet vendor bundle
+│   │   ├── static/                # Styles, map JavaScript, Leaflet & Three.js vendor bundle
 │   │   └── templates/             # Jinja2 HTML templates (dashboard, complaints, map, rides)
 │   └── alerts/                    # Municipal Alerts & Notifications
 │       ├── email_service.py       # Civic authority SMTP dispatcher
@@ -274,6 +278,8 @@ road-eye/
 │       └── 001_delete_fix.sql     # Foreign key constraints & delete cascade policies
 │
 ├── docs/                          # Documentation & Visual Assets
+│   ├── SYSTEM_ARCHITECTURE.md     # Formal Cyber-Physical System Specification (529 lines)
+│   ├── TAILSCALE_DEPLOYMENT.md    # Tailscale & Tailscale Funnel Node Runbook
 │   └── assets/                    # High-res mobile screenshots & 3D splat renders
 │
 ├── .env.example                   # Sanitized configuration template

@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Road Data Logger</string>
+	<string>RoadEye</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -46,10 +46,10 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>Road Sense captures road video and camera frames for real-time pothole and hazard detection.</string>
+	<string>RoadEye captures road video and camera frames for real-time pothole and hazard detection.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Road Sense encodes standard H.264/AAC audio alongside spatial dashcam video.</string>
+	<string>RoadEye encodes standard H.264/AAC audio alongside spatial dashcam video.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Road Sense logs security-bound GPS breadcrumbs to geotag road hazards and reconstruct 3D trajectories.</string>
+	<string>RoadEye logs security-bound GPS breadcrumbs to geotag road hazards and reconstruct 3D trajectories.</string>
 </dict>
 </plist>

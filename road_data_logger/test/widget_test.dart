@@ -17,7 +17,7 @@ void main() {
       ),
     );
 
-    expect(find.text("ROAD SENSE"), findsOneWidget);
+    expect(find.text("ROADEYE"), findsOneWidget);
     expect(find.text("Welcome back"), findsOneWidget);
     expect(find.text("EMAIL"), findsOneWidget);
     expect(find.text("PASSWORD"), findsOneWidget);
@@ -35,7 +35,8 @@ void main() {
         home: Scaffold(body: MapScreen()),
       ),
     );
-    await tester.pumpAndSettle();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 500));
 
     expect(find.byTooltip("Locate Nearest Detection"), findsOneWidget);
     expect(find.byTooltip("Zoom In"), findsOneWidget);

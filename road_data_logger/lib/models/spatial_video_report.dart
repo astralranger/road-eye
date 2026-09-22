@@ -94,6 +94,11 @@ class SpatialVideoReport {
   final String? errorMessage;
   final double? cavityVolumeLiters;
   final double? maxDepthCm;
+  final double? meanDepthCm;
+  final double? surfaceAreaSqm;
+  final double? lciIndex;
+  final int? voxelCount;
+  final String? splatPlyPath;
   final String? viewerHtmlPath;
 
   const SpatialVideoReport({
@@ -126,6 +131,11 @@ class SpatialVideoReport {
     this.errorMessage,
     this.cavityVolumeLiters,
     this.maxDepthCm,
+    this.meanDepthCm,
+    this.surfaceAreaSqm,
+    this.lciIndex,
+    this.voxelCount,
+    this.splatPlyPath,
     this.viewerHtmlPath,
   });
 
@@ -159,6 +169,11 @@ class SpatialVideoReport {
     String? errorMessage,
     double? cavityVolumeLiters,
     double? maxDepthCm,
+    double? meanDepthCm,
+    double? surfaceAreaSqm,
+    double? lciIndex,
+    int? voxelCount,
+    String? splatPlyPath,
     String? viewerHtmlPath,
   }) {
     return SpatialVideoReport(
@@ -191,6 +206,11 @@ class SpatialVideoReport {
       errorMessage: errorMessage ?? this.errorMessage,
       cavityVolumeLiters: cavityVolumeLiters ?? this.cavityVolumeLiters,
       maxDepthCm: maxDepthCm ?? this.maxDepthCm,
+      meanDepthCm: meanDepthCm ?? this.meanDepthCm,
+      surfaceAreaSqm: surfaceAreaSqm ?? this.surfaceAreaSqm,
+      lciIndex: lciIndex ?? this.lciIndex,
+      voxelCount: voxelCount ?? this.voxelCount,
+      splatPlyPath: splatPlyPath ?? this.splatPlyPath,
       viewerHtmlPath: viewerHtmlPath ?? this.viewerHtmlPath,
     );
   }
@@ -226,6 +246,11 @@ class SpatialVideoReport {
       'error_message': errorMessage,
       'cavity_volume_liters': cavityVolumeLiters,
       'max_depth_cm': maxDepthCm,
+      'mean_depth_cm': meanDepthCm,
+      'surface_area_sqm': surfaceAreaSqm,
+      'lci_index': lciIndex,
+      'voxel_count': voxelCount,
+      'splat_ply_path': splatPlyPath,
       'viewer_html_path': viewerHtmlPath,
     };
   }
@@ -298,7 +323,62 @@ class SpatialVideoReport {
       errorMessage: map['error_message']?.toString(),
       cavityVolumeLiters: (map['cavity_volume_liters'] as num?)?.toDouble(),
       maxDepthCm: (map['max_depth_cm'] as num?)?.toDouble(),
+      meanDepthCm: (map['mean_depth_cm'] as num?)?.toDouble(),
+      surfaceAreaSqm: (map['surface_area_sqm'] as num?)?.toDouble(),
+      lciIndex: (map['lci_index'] as num?)?.toDouble(),
+      voxelCount: (map['voxel_count'] as num?)?.toInt(),
+      splatPlyPath: map['splat_ply_path']?.toString(),
       viewerHtmlPath: map['viewer_html_path']?.toString(),
+    );
+  }
+
+  factory SpatialVideoReport.fromSupabaseMap(
+    Map<String, dynamic> reportMap, {
+    Map<String, dynamic>? reconstructionMap,
+    String? localPath,
+  }) {
+    final trailList = (reportMap['gps_trail'] as List<dynamic>?)
+            ?.map((e) => GpsBreadcrumb.fromMap(e as Map<String, dynamic>))
+            .toList() ??
+        [];
+
+    final splatStatus = reportMap['splat_status']?.toString() ?? 'queued';
+
+    return SpatialVideoReport(
+      id: reportMap['id']?.toString() ?? '',
+      userId: reportMap['user_id']?.toString() ?? '',
+      userEmail: reportMap['user_email']?.toString() ?? '',
+      recordedAt: DateTime.tryParse(reportMap['recorded_at']?.toString() ?? '') ?? DateTime.now(),
+      durationMs: (reportMap['duration_ms'] as num?)?.toInt() ?? 0,
+      resolution: reportMap['resolution']?.toString() ?? '1280x720',
+      fileSizeBytes: (reportMap['file_size_bytes'] as num?)?.toInt() ?? 0,
+      localVideoPath: localPath ?? '',
+      videoFilename: reportMap['video_filename']?.toString() ?? '',
+      storageStatus: reportMap['storage_status']?.toString() ?? 'local_only',
+      videoUrl: reportMap['video_url']?.toString(),
+      checksumSha256: reportMap['checksum_sha256']?.toString() ?? '',
+      pointCount: (reportMap['point_count'] as num?)?.toInt() ?? trailList.length,
+      startLat: (reportMap['start_lat'] as num?)?.toDouble() ?? 0.0,
+      startLon: (reportMap['start_lon'] as num?)?.toDouble() ?? 0.0,
+      endLat: (reportMap['end_lat'] as num?)?.toDouble() ?? 0.0,
+      endLon: (reportMap['end_lon'] as num?)?.toDouble() ?? 0.0,
+      distanceMeters: (reportMap['distance_meters'] as num?)?.toDouble() ?? 0.0,
+      avgSpeedKmh: (reportMap['avg_speed_kmh'] as num?)?.toDouble() ?? 0.0,
+      gpsTrail: trailList,
+      isTamperVerified: reportMap['is_tamper_verified'] as bool? ?? true,
+      splatStatus: splatStatus,
+      syncStatus: SyncStatus.synced,
+      processingNodeId: reportMap['processing_node_id']?.toString(),
+      progressPct: (reportMap['progress_pct'] as num?)?.toInt() ?? (splatStatus == 'completed' ? 100 : 0),
+      errorMessage: reportMap['error_message']?.toString(),
+      cavityVolumeLiters: (reconstructionMap?['total_cavity_volume_liters'] as num?)?.toDouble(),
+      maxDepthCm: (reconstructionMap?['max_depth_cm'] as num?)?.toDouble(),
+      meanDepthCm: (reconstructionMap?['mean_depth_cm'] as num?)?.toDouble(),
+      surfaceAreaSqm: (reconstructionMap?['surface_area_sqm'] as num?)?.toDouble(),
+      lciIndex: (reconstructionMap?['lci_index'] as num?)?.toDouble(),
+      voxelCount: (reconstructionMap?['voxel_count'] as num?)?.toInt(),
+      splatPlyPath: reconstructionMap?['splat_ply_path']?.toString(),
+      viewerHtmlPath: reconstructionMap?['viewer_html_path']?.toString(),
     );
   }
 

@@ -25,7 +25,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Road Sense Pro',
+      title: 'RoadEye',
       debugShowCheckedModeBanner: false,
       theme: UberTheme.darkTheme,
       home: _buildHome(),

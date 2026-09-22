@@ -37,8 +37,6 @@ class _DataCollectorViewState extends State<DataCollectorView>
   final SpatialSecurityService _spatialSecurityService = SpatialSecurityService();
   final SpatialQueueService _spatialQueueService = SpatialQueueService();
 
-  final TextEditingController _urlCtrl = TextEditingController();
-
   CaptureMode _selectedMode = CaptureMode.patrolStream;
   String _targetUrl = "Not Set";
   bool _isSystemReady = false;
@@ -75,7 +73,6 @@ class _DataCollectorViewState extends State<DataCollectorView>
     _sensorService.dispose();
     _apiService.dispose();
     _spatialSecurityService.dispose();
-    _urlCtrl.dispose();
     _statusMessageNotifier.dispose();
     _statusColorNotifier.dispose();
     super.dispose();
@@ -99,90 +96,15 @@ class _DataCollectorViewState extends State<DataCollectorView>
       if (!cameraOk) {
         _updateStatus("Camera Unavailable (Telemetry Mode)", UberColors.amber);
       }
-
-      if (_targetUrl == "Not Set") {
-        Future.delayed(const Duration(milliseconds: 600), () {
-          if (mounted && _targetUrl == "Not Set") {
-            _showUrlDialog();
-          }
-        });
-      }
     }
   }
 
   Future<void> _loadTargetUrl() async {
     final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString('target_url') ?? "Not Set";
+    final saved = prefs.getString('custom_compute_node_url') ?? prefs.getString('target_url') ?? "Not Set";
     if (mounted) {
       setState(() => _targetUrl = saved);
     }
-  }
-
-  Future<void> _saveTargetUrl(String rawUrl) async {
-    final sanitized = UrlHelper.sanitize(rawUrl);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('target_url', sanitized);
-    if (mounted) {
-      setState(() => _targetUrl = sanitized);
-    }
-  }
-
-  void _showUrlDialog() {
-    _urlCtrl.text = UrlHelper.toDisplayString(_targetUrl);
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => AlertDialog(
-        backgroundColor: UberColors.surface,
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: UberColors.border),
-        ),
-        title: const Text("Edge AI Node Connection", style: UberTypography.title),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              "Enter the inference server endpoint (e.g. 10.0.2.2:5000 for emulator, LAN IP, or Cloudflare URL):",
-              style: TextStyle(color: UberColors.textSecondary, fontSize: 13, height: 1.4),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _urlCtrl,
-              autofocus: true,
-              style: const TextStyle(color: UberColors.textPrimary, fontSize: 14),
-              decoration: const InputDecoration(
-                hintText: "10.0.2.2:5000",
-                prefixIcon: Icon(Icons.lan_outlined, color: UberColors.textSecondary, size: 20),
-              ),
-            ),
-          ],
-        ),
-        actionsPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        actions: [
-          TextButton(
-            child: const Text("CANCEL", style: TextStyle(color: UberColors.textSecondary, fontWeight: FontWeight.w600)),
-            onPressed: () => Navigator.pop(context),
-          ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: UberColors.white,
-              foregroundColor: UberColors.black,
-              minimumSize: const Size(100, 44),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
-            ),
-            child: const Text("SAVE", style: TextStyle(fontWeight: FontWeight.w700)),
-            onPressed: () {
-              if (_urlCtrl.text.trim().isNotEmpty) {
-                _saveTargetUrl(_urlCtrl.text.trim());
-                Navigator.pop(context);
-              }
-            },
-          )
-        ],
-      ),
-    );
   }
 
   void _updateStatus(String message, Color color) {
@@ -196,7 +118,22 @@ class _DataCollectorViewState extends State<DataCollectorView>
 
   void _toggleStreaming() {
     if (_targetUrl == "Not Set" || !UrlHelper.isValidUrl(_targetUrl)) {
-      _showUrlDialog();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text("Configure Compute Node endpoint in the Account tab."),
+          backgroundColor: UberColors.surfaceElevated,
+          action: SnackBarAction(
+            label: "CONFIGURE",
+            textColor: UberColors.white,
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const AccountScreen()),
+              ).then((_) => _loadTargetUrl());
+            },
+          ),
+        ),
+      );
       return;
     }
     _isStreaming ? _stopStreaming() : _startStreaming();
@@ -597,7 +534,7 @@ class _DataCollectorViewState extends State<DataCollectorView>
                               Text(
                                 _isRecordingSpatialVideo
                                     ? "REC SPATIAL"
-                                    : (_isStreaming ? "PATROL ACTIVE" : "ROAD SENSE"),
+                                    : (_isStreaming ? "PATROL ACTIVE" : "ROADEYE"),
                                 style: UberTypography.caption.copyWith(
                                   color: UberColors.textPrimary,
                                   fontWeight: FontWeight.w800,
@@ -615,7 +552,7 @@ class _DataCollectorViewState extends State<DataCollectorView>
                           onTap: () => Navigator.push(
                             context,
                             MaterialPageRoute(builder: (_) => const AccountScreen()),
-                          ),
+                          ).then((_) => _loadTargetUrl()),
                         ),
                         const SizedBox(width: 8),
 
@@ -627,14 +564,6 @@ class _DataCollectorViewState extends State<DataCollectorView>
                             context,
                             MaterialPageRoute(builder: (_) => const MapScreen()),
                           ),
-                        ),
-                        const SizedBox(width: 8),
-
-                        // Settings Button
-                        _buildHeaderIconButton(
-                          icon: Icons.settings_outlined,
-                          tooltip: "Node Configuration",
-                          onTap: _showUrlDialog,
                         ),
                         const SizedBox(width: 8),
 
@@ -1139,14 +1068,19 @@ class _DataCollectorViewState extends State<DataCollectorView>
         // Node Info
         Expanded(
           child: InkWell(
-            onTap: _showUrlDialog,
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const AccountScreen()),
+              ).then((_) => _loadTargetUrl());
+            },
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text("TARGET NODE", style: UberTypography.caption.copyWith(fontSize: 10)),
                 const SizedBox(height: 3),
                 Text(
-                  _targetUrl == "Not Set" ? "Tap to configure" : UrlHelper.toDisplayString(_targetUrl),
+                  _targetUrl == "Not Set" ? "Configure in Account" : UrlHelper.toDisplayString(_targetUrl),
                   style: const TextStyle(
                     color: UberColors.blue,
                     fontSize: 13,

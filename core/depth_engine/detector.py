@@ -112,7 +112,11 @@ class RFDETRDetector:
                 pretrain_weights=checkpoint_path,
                 resolution=640
             )
-            self.model.optimize_for_inference()
+            try:
+                self.model.optimize_for_inference()
+                print("[RFDETRDetector] RF-DETR optimized for inference.")
+            except Exception as opt_err:
+                print(f"[RFDETRDetector] Note: Inference optimization skipped ({opt_err}).")
             print("[RFDETRDetector] RF-DETR initialized successfully.")
         except Exception as e:
             print(f"[RFDETRDetector] Warning: Could not initialize native RFDETRLarge ({e}). Falling back to ROI mode.")

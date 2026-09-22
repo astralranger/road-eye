@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import '../config/app_config.dart';
 import '../models/spatial_video_report.dart';
 import '../utils/url_helper.dart';
@@ -125,6 +126,16 @@ class TailscaleFunnelUploadHandler implements VideoUploadHandler {
     uploadInitPayload['storage_status'] = 'uploading';
     uploadInitPayload['splat_status'] = 'uploading';
     uploadInitPayload['processing_node_id'] = nodeId;
+    uploadInitPayload['progress_pct'] = 5;
+    uploadInitPayload['error_message'] = 'Uploading video to compute node...';
+
+    // Update local item immediately so UI reflects 5%
+    SpatialQueueService().updateReportProgress(
+      id: report.id,
+      splatStatus: 'uploading',
+      progressPct: 5,
+      processingNodeId: nodeId,
+    );
 
     await AppConfig.supabase
         .from('spatial_video_reports')
@@ -168,13 +179,22 @@ class TailscaleFunnelUploadHandler implements VideoUploadHandler {
     if (response.statusCode == 202 || response.statusCode == 200) {
       debugPrint("TailscaleFunnel: Upload accepted by node $nodeId.");
 
-      // Update Supabase to 'processing'
+      // Update Supabase to 'processing' (15%)
       await AppConfig.supabase.from('spatial_video_reports').update({
         'storage_status': 'offloaded_to_node',
         'splat_status': 'processing',
-        'progress_pct': 10,
+        'progress_pct': 15,
         'processing_node_id': nodeId,
+        'error_message': 'Video received by node. Initializing 3DGS pipeline.',
       }).eq('id', report.id);
+
+      // Update local item immediately
+      SpatialQueueService().updateReportProgress(
+        id: report.id,
+        splatStatus: 'processing',
+        progressPct: 15,
+        processingNodeId: nodeId,
+      );
 
       return true;
     } else {
@@ -275,13 +295,13 @@ class TailscaleFunnelUploadHandler implements VideoUploadHandler {
   static Future<Map<String, dynamic>?> findActiveComputeNode() async {
     try {
       if (!AppConfig.isSupabaseInitialized) return null;
-      final cutoff = DateTime.now().toUtc().subtract(const Duration(seconds: 90)).toIso8601String();
+      final cutoff = DateTime.now().toUtc().subtract(const Duration(seconds: 120)).toIso8601String();
       final List<dynamic> response = await AppConfig.supabase
           .from('system_health')
           .select()
           .inFilter('status', ['online', 'busy'])
           .gte('last_heartbeat', cutoff)
-          .order('active_jobs', ascending: true)
+          .order('last_heartbeat', ascending: false)
           .limit(1);
 
       if (response.isNotEmpty) {
@@ -337,6 +357,9 @@ class SpatialQueueService {
   Directory? _videoDir;
   File? _queueFile;
 
+  RealtimeChannel? _realtimeChannel;
+  Timer? _pollingTimer;
+
   final ValueNotifier<List<SpatialVideoReport>> reportsNotifier = ValueNotifier<List<SpatialVideoReport>>([]);
   final ValueNotifier<bool> isSyncingNotifier = ValueNotifier<bool>(false);
 
@@ -346,7 +369,8 @@ class SpatialQueueService {
     _uploadHandler = handler;
   }
 
-  /// Initializes directories, loads local queue, and recovers any interrupted recording sessions.
+  /// Initializes directories, loads local queue, recovers interrupted recording sessions,
+  /// attaches global Supabase Realtime listeners, and reconciles remote state.
   Future<void> initialize() async {
     try {
       final appDocsDir = await getApplicationDocumentsDirectory();
@@ -358,6 +382,16 @@ class SpatialQueueService {
       _queueFile = File('${appDocsDir.path}/spatial_reports_queue.json');
       await _loadQueueFromDisk();
       await recoverInterruptedSessions();
+
+      // Listen to Supabase Auth state changes to re-subscribe Realtime
+      if (AppConfig.isSupabaseInitialized) {
+        AppConfig.supabase.auth.onAuthStateChange.listen((data) {
+          _setupRealtimeSubscription();
+          unawaited(refreshRemoteStatuses());
+        });
+        _setupRealtimeSubscription();
+        unawaited(refreshRemoteStatuses());
+      }
 
       // Attempt background sync if online
       unawaited(syncPendingReports());
@@ -474,7 +508,7 @@ class SpatialQueueService {
     }
   }
 
-  /// Updates a report's reconstruction progress from Supabase Realtime event
+  /// Updates a report's reconstruction progress from Supabase Realtime event or polling
   void updateReportProgress({
     required String id,
     required String splatStatus,
@@ -482,6 +516,11 @@ class SpatialQueueService {
     String? processingNodeId,
     double? cavityVolumeLiters,
     double? maxDepthCm,
+    double? meanDepthCm,
+    double? surfaceAreaSqm,
+    double? lciIndex,
+    int? voxelCount,
+    String? splatPlyPath,
     String? viewerHtmlPath,
   }) {
     final index = _reports.indexWhere((r) => r.id == id);
@@ -493,9 +532,198 @@ class SpatialQueueService {
         processingNodeId: processingNodeId ?? old.processingNodeId,
         cavityVolumeLiters: cavityVolumeLiters ?? old.cavityVolumeLiters,
         maxDepthCm: maxDepthCm ?? old.maxDepthCm,
+        meanDepthCm: meanDepthCm ?? old.meanDepthCm,
+        surfaceAreaSqm: surfaceAreaSqm ?? old.surfaceAreaSqm,
+        lciIndex: lciIndex ?? old.lciIndex,
+        voxelCount: voxelCount ?? old.voxelCount,
+        splatPlyPath: splatPlyPath ?? old.splatPlyPath,
         viewerHtmlPath: viewerHtmlPath ?? old.viewerHtmlPath,
       );
       _saveQueueToDisk();
+      _checkAndSchedulePolling();
+    }
+  }
+
+  void _setupRealtimeSubscription() {
+    if (!AppConfig.isSupabaseInitialized) return;
+    final user = AppConfig.currentUser;
+    if (user == null) return;
+
+    try {
+      _realtimeChannel?.unsubscribe();
+      _realtimeChannel = AppConfig.supabase
+          .channel('global_spatial_pipeline_${user.id}')
+          .onPostgresChanges(
+            event: PostgresChangeEvent.update,
+            schema: 'public',
+            table: 'spatial_video_reports',
+            filter: PostgresChangeFilter(
+              type: PostgresChangeFilterType.eq,
+              column: 'user_id',
+              value: user.id,
+            ),
+            callback: (payload) {
+              final newRecord = payload.newRecord;
+              final id = newRecord['id']?.toString();
+              if (id != null) {
+                final splatStatus = newRecord['splat_status']?.toString() ?? 'queued';
+                final progressPct = (newRecord['progress_pct'] as num?)?.toInt() ?? 0;
+                final nodeId = newRecord['processing_node_id']?.toString();
+                updateReportProgress(
+                  id: id,
+                  splatStatus: splatStatus,
+                  progressPct: progressPct,
+                  processingNodeId: nodeId,
+                );
+                if (splatStatus == 'completed') {
+                  unawaited(refreshRemoteStatuses());
+                }
+              }
+            },
+          )
+          .onPostgresChanges(
+            event: PostgresChangeEvent.insert,
+            schema: 'public',
+            table: 'spatial_reconstructions',
+            filter: PostgresChangeFilter(
+              type: PostgresChangeFilterType.eq,
+              column: 'user_id',
+              value: user.id,
+            ),
+            callback: (payload) {
+              final record = payload.newRecord;
+              final reportId = record['report_id']?.toString();
+              if (reportId != null) {
+                updateReportProgress(
+                  id: reportId,
+                  splatStatus: 'completed',
+                  progressPct: 100,
+                  cavityVolumeLiters: (record['total_cavity_volume_liters'] as num?)?.toDouble(),
+                  maxDepthCm: (record['max_depth_cm'] as num?)?.toDouble(),
+                  meanDepthCm: (record['mean_depth_cm'] as num?)?.toDouble(),
+                  surfaceAreaSqm: (record['surface_area_sqm'] as num?)?.toDouble(),
+                  lciIndex: (record['lci_index'] as num?)?.toDouble(),
+                  voxelCount: (record['voxel_count'] as num?)?.toInt(),
+                  splatPlyPath: record['splat_ply_path']?.toString(),
+                  viewerHtmlPath: record['viewer_html_path']?.toString(),
+                );
+              }
+            },
+          )
+          .subscribe();
+      debugPrint("SpatialQueueService: Global Realtime channel subscribed for user ${user.id}");
+    } catch (e) {
+      debugPrint("SpatialQueueService Realtime subscription error: $e");
+    }
+  }
+
+  /// Pulls the latest processing & reconstruction status from Supabase
+  /// to resolve any frozen or desynchronized states across the application.
+  Future<void> refreshRemoteStatuses() async {
+    if (!AppConfig.isSupabaseInitialized) return;
+    final user = AppConfig.currentUser;
+    if (user == null) return;
+
+    try {
+      // 1. Fetch all reports from Supabase for this user
+      final List<dynamic> remoteReports = await AppConfig.supabase
+          .from('spatial_video_reports')
+          .select()
+          .eq('user_id', user.id)
+          .order('recorded_at', ascending: false)
+          .timeout(const Duration(seconds: 10));
+
+      if (remoteReports.isEmpty) return;
+
+      // 2. Fetch all reconstructions for this user
+      final List<dynamic> remoteReconstructions = await AppConfig.supabase
+          .from('spatial_reconstructions')
+          .select()
+          .eq('user_id', user.id)
+          .timeout(const Duration(seconds: 10));
+
+      final Map<String, Map<String, dynamic>> reconMap = {};
+      for (final r in remoteReconstructions) {
+        if (r is Map<String, dynamic> && r['report_id'] != null) {
+          reconMap[r['report_id'].toString()] = r;
+        }
+      }
+
+      bool hasChanges = false;
+      for (final raw in remoteReports) {
+        if (raw is! Map<String, dynamic>) continue;
+        final id = raw['id']?.toString();
+        if (id == null) continue;
+
+        final recon = reconMap[id];
+        final splatStatus = raw['splat_status']?.toString() ?? 'queued';
+        final progressPct = (raw['progress_pct'] as num?)?.toInt() ?? (splatStatus == 'completed' ? 100 : 0);
+        final nodeId = raw['processing_node_id']?.toString();
+
+        final index = _reports.indexWhere((r) => r.id == id);
+        if (index != -1) {
+          final old = _reports[index];
+          final updated = old.copyWith(
+            splatStatus: splatStatus,
+            progressPct: progressPct,
+            processingNodeId: nodeId ?? old.processingNodeId,
+            syncStatus: SyncStatus.synced,
+            cavityVolumeLiters: (recon?['total_cavity_volume_liters'] as num?)?.toDouble() ?? old.cavityVolumeLiters,
+            maxDepthCm: (recon?['max_depth_cm'] as num?)?.toDouble() ?? old.maxDepthCm,
+            meanDepthCm: (recon?['mean_depth_cm'] as num?)?.toDouble() ?? old.meanDepthCm,
+            surfaceAreaSqm: (recon?['surface_area_sqm'] as num?)?.toDouble() ?? old.surfaceAreaSqm,
+            lciIndex: (recon?['lci_index'] as num?)?.toDouble() ?? old.lciIndex,
+            voxelCount: (recon?['voxel_count'] as num?)?.toInt() ?? old.voxelCount,
+            splatPlyPath: recon?['splat_ply_path']?.toString() ?? old.splatPlyPath,
+            viewerHtmlPath: recon?['viewer_html_path']?.toString() ?? old.viewerHtmlPath,
+          );
+
+          if (old.splatStatus != updated.splatStatus ||
+              old.progressPct != updated.progressPct ||
+              old.viewerHtmlPath != updated.viewerHtmlPath ||
+              old.maxDepthCm != updated.maxDepthCm) {
+            _reports[index] = updated;
+            hasChanges = true;
+          }
+        } else {
+          // Report exists in Supabase but not in local queue, import it!
+          final imported = SpatialVideoReport.fromSupabaseMap(
+            raw,
+            reconstructionMap: recon,
+          );
+          _reports.add(imported);
+          hasChanges = true;
+        }
+      }
+
+      if (hasChanges) {
+        _reports.sort((a, b) => b.recordedAt.compareTo(a.recordedAt));
+        await _saveQueueToDisk();
+      }
+
+      _checkAndSchedulePolling();
+    } catch (e) {
+      debugPrint("SpatialQueueService: Error refreshing remote statuses: $e");
+    }
+  }
+
+  void _checkAndSchedulePolling() {
+    final hasActiveJobs = _reports.any((r) =>
+      r.splatStatus == 'uploading' ||
+      r.splatStatus == 'processing' ||
+      r.splatStatus == 'waiting_for_node'
+    );
+
+    if (hasActiveJobs && (_pollingTimer == null || !_pollingTimer!.isActive)) {
+      debugPrint("SpatialQueueService: Active jobs detected, starting 3s progress polling...");
+      _pollingTimer?.cancel();
+      _pollingTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
+        await refreshRemoteStatuses();
+      });
+    } else if (!hasActiveJobs && _pollingTimer != null) {
+      debugPrint("SpatialQueueService: All jobs completed or idle. Halting polling timer.");
+      _pollingTimer?.cancel();
+      _pollingTimer = null;
     }
   }
 
